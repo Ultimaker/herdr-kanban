@@ -292,8 +292,15 @@ def _cache_path(slug: str, project_number: int) -> Path:
     return state_dir() / "cache" / f"{slug}-p{project_number}.json"
 
 
-def save_board_cache(slug: str, project_number: int, tickets: list[dict[str, Any]]) -> None:
-    payload = {"fetched_at": time.time(), "tickets": tickets}
+def save_board_cache(
+    slug: str,
+    project_number: int,
+    tickets: list[dict[str, Any]],
+    schema: dict[str, Any] | None = None,
+) -> None:
+    payload: dict[str, Any] = {"fetched_at": time.time(), "tickets": tickets}
+    if schema is not None:
+        payload["schema"] = schema
     _atomic_write_json(_cache_path(slug, project_number), payload)
 
 
@@ -302,6 +309,17 @@ def load_board_cache(slug: str, project_number: int) -> tuple[float, list[dict[s
     if not isinstance(raw, dict) or not isinstance(raw.get("tickets"), list):
         return None
     return float(raw.get("fetched_at") or 0.0), raw["tickets"]
+
+
+def load_board_cache_with_schema(
+    slug: str,
+    project_number: int,
+) -> tuple[float, dict[str, Any] | None, list[dict[str, Any]]] | None:
+    raw = _read_json(_cache_path(slug, project_number), None)
+    if not isinstance(raw, dict) or not isinstance(raw.get("tickets"), list):
+        return None
+    schema_raw = raw.get("schema") if isinstance(raw.get("schema"), dict) else None
+    return float(raw.get("fetched_at") or 0.0), schema_raw, raw["tickets"]
 
 
 # --- What's New Digest State ---

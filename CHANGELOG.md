@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.9 (2026-11-19)
+
+- **Space-Scoped Target Resolution & Cross-Space Isolation (`resolveSpaceTarget`, `refresh`, `renderFrame`)**:
+  - Fix `resolveSpaceTarget` in `mods/herdr-kanban/main.js` to map terminal panes via `targetSpace.tabs` instead of the non-existent `pn.space` property, prioritize the active tab's focused/first terminal CWD, and remove the cross-space fallback loop so spaces without `.herdr-kanban.toml` never leak another space's Kanban board.
+  - Scope cached boards and CWDs per `spaceId` (`bus.boardBySpace`, `bus.resolvedCwdBySpace`), support reactive `shared("kanban.nav")` navigation without requiring `<mod>.<command>` calls when hidden, cancel stale in-flight refreshes on space switch (`refreshSeq`), and render a quiet empty state in non-Kanban spaces.
+- **GitHub GraphQL Rate-Limit & Offline Cache Fallback (`refresh_board`, `load_cached_board`)**:
+  - Persist `ProjectSchema` alongside cached tickets in `~/.local/state/herdr-kanban/cache/` and automatically fall back to the local cache when `gh api graphql` raises `GitHubError` (e.g. rate-limited or offline).
+- **Antigravity (`agy`) Default Agent & Interactive Dispatch (`herdr.py`)**:
+  - Default `DEFAULT_AGENTS` to `agy` first and pass `-i` when spawning interactive `agy` tabs in `herdr-app`.
+
 ## 0.4.8 (2026-11-14)
 
 - **Fixed "This view could not be rendered — interrupted" on large boards (`renderCard`)**:

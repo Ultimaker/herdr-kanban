@@ -13,6 +13,8 @@ import {
   notify,
   nextCommand,
   props,
+  shared,
+  checking,
 } from "herdr";
 
 const COLUMNS = [
@@ -31,7 +33,7 @@ const EMPTY_COL_COMPACT_WIDTH = 104;
 const UNIFORM_COL_WIDTH = 248;
 const CARD_EST_HEIGHT = 116;
 const DEFAULT_PRIORITIES = ["P0", "P1", "P2", "P3"];
-const DEFAULT_AGENTS = ["claude", "agy", "codex", "opencode", "gemini", "copilot"];
+const DEFAULT_AGENTS = ["agy", "claude", "codex", "opencode", "gemini", "copilot"];
 
 function withAlpha(hexColor, alphaHex) {
   const c = String(hexColor || "").trim();
@@ -450,73 +452,59 @@ function resolveSpaceTarget(overrideSpaceId, resolvedCwdBySpace) {
   }
 
   const spaceId = targetSpace?.id || p.space || null;
-  const focusedPane =
-    (f.pane ? allPanes.find((pn) => pn.pane === f.pane && pn.terminal) : null) ||
-    allPanes.find((pn) => pn.focused && pn.terminal) ||
+  const spaceTabIds = new Set((targetSpace?.tabs || []).map((tb) => tb.id));
+  const spacePanes = allPanes.filter((pn) => spaceTabIds.has(pn.tab));
+  const focusedInSpace = Boolean(targetSpace && f?.space === targetSpace.id);
+  const activeTabId =
+    (focusedInSpace && f?.tab && spaceTabIds.has(f.tab) ? f.tab : null) ||
+    targetSpace?.tabs?.find((tb) => tb.active)?.id ||
     null;
+  const activeTabPanes = activeTabId
+    ? spacePanes.filter((pn) => pn.tab === activeTabId)
+    : [];
+  const focusedPane =
+    focusedInSpace && f?.pane
+      ? spacePanes.find((pn) => pn.pane === f.pane && pn.terminal)
+      : null;
 
   const on = cleanTarget(
     p.on ||
       p.machine ||
       targetSpace?.machine ||
-      (f?.pane === null && f.terminal?.includes("/") ? f.terminal.split("/")[0] : null)
+      (focusedInSpace && f?.pane === null && f.terminal?.includes("/")
+        ? f.terminal.split("/")[0]
+        : null)
   );
 
   const candidates = [];
   if (!overrideSpaceId && (p.cwd || p.folder)) {
     addUniqueCwd(candidates, p.cwd || p.folder);
   }
-  if (spaceId && cache[spaceId]) {
-    addUniqueCwd(candidates, cache[spaceId]);
-  }
-  if (!overrideSpaceId && focusedPane && (!spaceId || focusedPane.space === spaceId)) {
+  if (!overrideSpaceId && focusedPane?.cwd) {
     addUniqueCwd(candidates, focusedPane.cwd);
   }
-  if (spaceId) {
-    for (const pn of allPanes) {
-      if (pn.space === spaceId && pn.cwd) {
-        addUniqueCwd(candidates, pn.cwd);
-      }
-    }
-  } else {
-    for (const pn of allPanes) {
-      if (pn.cwd) addUniqueCwd(candidates, pn.cwd);
-    }
+  for (const pn of activeTabPanes) {
+    if (pn.cwd) addUniqueCwd(candidates, pn.cwd);
   }
-  if (!overrideSpaceId && f?.cwd) {
+  if (!overrideSpaceId && focusedInSpace && f?.cwd) {
     addUniqueCwd(candidates, f.cwd);
   }
-  if (targetSpace?.folder) {
+  for (const pn of spacePanes) {
+    if (pn.cwd) addUniqueCwd(candidates, pn.cwd);
+  }
+  if (candidates.length === 0 && targetSpace?.folder && targetSpace?.name !== "~") {
     addUniqueCwd(candidates, targetSpace.folder);
   }
-  for (const pn of allPanes) {
-    if (!pn.cwd) continue;
-    const pnSpace = allSpaces.find((s) => s.id === pn.space);
-    const pnMachine = cleanTarget(
-      pnSpace?.machine || (pn.space && pn.space.includes("/") ? pn.space.split("/")[0] : null)
-    );
-    if (pnMachine === on) {
-      addUniqueCwd(candidates, pn.cwd);
-    }
-  }
-  const baseCands = [...candidates];
-  for (const sp of allSpaces) {
-    if (cleanTarget(sp.machine) === on) {
-      if (sp.name && sp.name !== "~") {
-        for (const bc of baseCands) {
-          const idx = bc.lastIndexOf("/");
-          if (idx > 0) {
-            addUniqueCwd(candidates, `${bc.slice(0, idx)}/${sp.name}`);
-          }
-        }
-      }
-      if (sp.folder) {
-        addUniqueCwd(candidates, sp.folder);
-      }
+  if (spaceId && cache[spaceId] && candidates.includes(cache[spaceId])) {
+    const preferred = cache[spaceId];
+    const idx = candidates.indexOf(preferred);
+    if (idx > 0) {
+      candidates.splice(idx, 1);
+      candidates.unshift(preferred);
     }
   }
 
-  const cwd = (spaceId && cache[spaceId]) || candidates[0] || null;
+  const cwd = candidates[0] || null;
   return {
     cwd,
     candidates,
@@ -618,7 +606,7 @@ export default class KanbanBoard extends View {
       quickFilter: "active", // "active" | "all" | "p0"
       compactEmpty: true,
       viewMode: "board", // "board" | "whats_new"
-      agentKind: "claude",
+      agentKind: "agy",
       overrideSpaceId: null,
       showDrawer: true,
       drawerTall: false,
@@ -634,17 +622,23 @@ export default class KanbanBoard extends View {
       bus.viewMode = props().view;
     }
     bus.resolvedCwdBySpace ??= {};
+    bus.boardBySpace ??= {};
     bus.views.add(this);
     this.bus = bus;
 
-    this.board = bus.lastBoard || null;
+    this.overrideSpaceId = bus.overrideSpaceId;
+    const initTarget = resolveSpaceTarget(this.overrideSpaceId, bus.resolvedCwdBySpace);
+    this.board = (initTarget.spaceId && bus.boardBySpace[initTarget.spaceId]) || null;
+    this.noKanbanInSpace = false;
     this.loading = false;
+    this.loadingTargetKey = "";
+    this.refreshSeq = 0;
+    this.lastNavSeq = 0;
     this.busyText = "";
     this.error = "";
     this.statusMessage = "";
     this.typing = false;
 
-    this.overrideSpaceId = bus.overrideSpaceId;
     this.lastTargetKey = "";
     this.repoFilter = bus.repoFilter;
     this.quickFilter = bus.quickFilter || "active";
@@ -709,6 +703,9 @@ export default class KanbanBoard extends View {
     this.depositTitleInput.on("submit", (_e, cx) => this.submitDeposit(cx));
     this.askInput.on("submit", (_e, cx) => this.submitAsk(this.selectedTicket(), cx));
 
+    if (!checking()) {
+      this.consumeSharedNav(cx);
+    }
     this.refresh(cx, false);
 
     cx.timer.every(12000, (cx) => {
@@ -748,20 +745,28 @@ export default class KanbanBoard extends View {
     });
   }
 
-  target() {
-    const t = resolveSpaceTarget(this.overrideSpaceId, this.bus?.resolvedCwdBySpace);
-    const cacheKey = t.spaceId || `machine:${t.on || "local"}`;
-    const cachedCwd =
-      (this.bus && this.bus.resolvedCwdBySpace && this.bus.resolvedCwdBySpace[cacheKey]) ||
-      this.activeCwd ||
-      (this.bus && this.bus.lastValidCwd);
-    if (cachedCwd) {
-      t.cwd = cachedCwd;
-      if (Array.isArray(t.candidates) && t.candidates[0] !== cachedCwd) {
-        t.candidates = [cachedCwd, ...t.candidates.filter((c) => c !== cachedCwd)];
-      }
+  consumeSharedNav(cx) {
+    const nav = shared("kanban.nav");
+    if (!nav || typeof nav !== "object") return false;
+    const seq = Number(nav.seq || 0);
+    if (!seq || seq <= this.lastNavSeq) return false;
+    this.lastNavSeq = seq;
+    if (nav.viewMode === "board" || nav.viewMode === "whats_new") {
+      this.syncBus({ viewMode: nav.viewMode }, cx);
     }
-    return t;
+    if (nav.selectedRef) {
+      this.selectedRef = String(nav.selectedRef);
+    }
+    if (nav.center) {
+      this.panX = 0;
+      this.panY = 0;
+      this.zoom = 1;
+    }
+    return Boolean(nav.refresh || nav.viewMode || nav.selectedRef);
+  }
+
+  target() {
+    return resolveSpaceTarget(this.overrideSpaceId, this.bus?.resolvedCwdBySpace);
   }
 
   syncBus(patch, cx) {
@@ -798,11 +803,7 @@ export default class KanbanBoard extends View {
 
   execKanban(args, targetOverride) {
     const tgt = targetOverride || this.target();
-    const cwd =
-      (targetOverride && targetOverride.cwd) ||
-      this.activeCwd ||
-      (this.bus && this.bus.lastValidCwd) ||
-      tgt.cwd;
+    const cwd = (targetOverride && targetOverride.cwd) || this.activeCwd || tgt.cwd;
     const fullArgs = args.length > 0 ? [args[0]] : [];
     if (cwd) {
       fullArgs.push("--cwd", cwd);
@@ -821,14 +822,19 @@ export default class KanbanBoard extends View {
         : tgt.cwd
         ? [tgt.cwd]
         : [];
-    this.lastTargetKey = `${tgt.on || "local"}:${tgt.spaceId || ""}:${tgt.cwd || ""}`;
+    const targetKey = `${tgt.on || "local"}:${tgt.spaceId || ""}:${tgt.cwd || ""}`;
+    this.lastTargetKey = targetKey;
+    const reqSeq = ++this.refreshSeq;
+
     if (!candidates.length) {
       this.board = null;
+      this.noKanbanInSpace = true;
       this.loading = false;
-      this.error = "Open or focus a repository workspace in Herdr to view its Kanban board.";
+      this.error = "";
       cx.notify();
       return;
     }
+    this.loadingTargetKey = targetKey;
     if (!silent) {
       this.loading = true;
       this.error = "";
@@ -847,14 +853,11 @@ export default class KanbanBoard extends View {
           } catch {
             continue;
           }
+          if (reqSeq !== this.refreshSeq) return;
           lastRes = res;
           if (res && res.code === 0) {
-            const cacheKey = tgt.spaceId || `machine:${tgt.on || "local"}`;
-            if (this.bus && this.bus.resolvedCwdBySpace) {
-              this.bus.resolvedCwdBySpace[cacheKey] = candCwd;
-              if (tgt.spaceId) {
-                this.bus.resolvedCwdBySpace[tgt.spaceId] = candCwd;
-              }
+            if (tgt.spaceId && this.bus && this.bus.resolvedCwdBySpace) {
+              this.bus.resolvedCwdBySpace[tgt.spaceId] = candCwd;
             }
             break;
           }
@@ -867,6 +870,8 @@ export default class KanbanBoard extends View {
           }
         }
 
+        if (reqSeq !== this.refreshSeq) return;
+
         const res = lastRes;
         if (!res || res.code !== 0) {
           const stderr = (res && (res.stderr || res.stdout)) || "Failed to load herdr-kanban board";
@@ -875,7 +880,21 @@ export default class KanbanBoard extends View {
             const j = JSON.parse(stderr);
             if (j && j.error) parsedErr = j.error;
           } catch {}
-          if (!silent || !this.board) {
+          const lowerErr = parsedErr.toLowerCase();
+          const isNoBoard =
+            lowerErr.includes(".herdr-kanban.toml") ||
+            lowerErr.includes("not inside a git repository") ||
+            lowerErr.includes("no such file or directory") ||
+            lowerErr.includes("command not found");
+          if (isNoBoard) {
+            this.board = null;
+            this.noKanbanInSpace = true;
+            this.error = "";
+            if (tgt.spaceId && this.bus?.boardBySpace) {
+              delete this.bus.boardBySpace[tgt.spaceId];
+            }
+          } else if (!silent || !this.board) {
+            this.noKanbanInSpace = false;
             this.error = parsedErr;
           }
           this.loading = false;
@@ -885,10 +904,11 @@ export default class KanbanBoard extends View {
 
         const data = JSON.parse(res.stdout);
         this.board = data;
+        this.noKanbanInSpace = false;
         this.activeCwd = chosenCwd;
-        if (this.bus) {
-          this.bus.lastBoard = data;
-          if (chosenCwd) this.bus.lastValidCwd = chosenCwd;
+        if (this.bus && tgt.spaceId) {
+          this.bus.boardBySpace ??= {};
+          this.bus.boardBySpace[tgt.spaceId] = data;
         }
         this.error = "";
         this.loading = false;
@@ -902,6 +922,7 @@ export default class KanbanBoard extends View {
         this.syncSelectionAfterLoad();
         cx.notify();
       } catch (err) {
+        if (reqSeq !== this.refreshSeq) return;
         if (!silent || !this.board) {
           this.error = String(err && err.message ? err.message : err);
         }
@@ -1354,7 +1375,7 @@ export default class KanbanBoard extends View {
     if (!ticket || this.busyText) return;
     const cliRef = ticket.cli_ref || String(ticket.number);
     const disp = ticket.ref || `#${ticket.number}`;
-    const kind = this.agentKind || "claude";
+    const kind = this.agentKind || "agy";
     const tgt = this.target();
     const effectiveCwd = this.activeCwd || (this.bus && this.bus.lastValidCwd) || tgt.cwd;
 
@@ -1410,7 +1431,7 @@ export default class KanbanBoard extends View {
   synthesizeWhatsNew(cx) {
     if (this.busyText) return;
     const tgt = this.target();
-    const kind = this.agentKind || "claude";
+    const kind = this.agentKind || "agy";
     const effectiveCwd = this.activeCwd || (this.bus && this.bus.lastValidCwd) || tgt.cwd;
     this.busyText = `Summarizing landed work with ${kind}…`;
     this.error = "";
@@ -1446,7 +1467,7 @@ export default class KanbanBoard extends View {
   dispatchWhatsNewAgent(cx) {
     if (this.busyText) return;
     const tgt = this.target();
-    const kind = this.agentKind || "claude";
+    const kind = this.agentKind || "agy";
     const effectiveCwd = this.activeCwd || (this.bus && this.bus.lastValidCwd) || tgt.cwd;
     this.busyText = `Opening ${kind} tab for What's New briefing…`;
     this.error = "";
@@ -3274,7 +3295,7 @@ export default class KanbanBoard extends View {
                   )
               )
               .child(
-                btn("wn-synthesize", `Summarize (${this.agentKind || "claude"})`, t, {
+                btn("wn-synthesize", `Summarize (${this.agentKind || "agy"})`, t, {
                   primary: true,
                   small: true,
                   iconPath: "mods/herdr-kanban/sparkles.svg",
@@ -4830,11 +4851,19 @@ export default class KanbanBoard extends View {
     const t = theme();
     const p = props() || {};
     const part = p.part || "";
+    const navTriggered = !checking() && this.consumeSharedNav(cx);
     const tgt = this.target();
     const curTargetKey = `${tgt.on || "local"}:${tgt.spaceId || ""}:${tgt.cwd || ""}`;
-    if (curTargetKey !== this.lastTargetKey && !this.loading) {
+    if (!checking() && (curTargetKey !== this.lastTargetKey || navTriggered)) {
+      const targetChanged = curTargetKey !== this.lastTargetKey;
       this.lastTargetKey = curTargetKey;
-      this.refresh(cx, true);
+      if (targetChanged) {
+        this.activeCwd = null;
+        this.board = (tgt.spaceId && this.bus?.boardBySpace?.[tgt.spaceId]) || null;
+        this.noKanbanInSpace = false;
+        this.error = "";
+      }
+      this.refresh(cx, Boolean(this.board));
     }
 
     if (this.bus) {
@@ -4932,7 +4961,31 @@ export default class KanbanBoard extends View {
                 )
             )
           )
-          .when(Boolean(!this.loading && !this.board && this.error), (d) =>
+          .when(Boolean(!this.loading && !this.board && this.noKanbanInSpace), (d) =>
+            d.child(
+              v_flex()
+                .flex_1()
+                .h_full()
+                .items_center()
+                .justify_center()
+                .gap(6)
+                .p(24)
+                .child(
+                  div()
+                    .text_size(12.5)
+                    .font_medium()
+                    .text_color(t.muted)
+                    .child("No Kanban board configured for this space")
+                )
+                .child(
+                  div()
+                    .text_size(11)
+                    .text_color(t.dim)
+                    .child("Switch to a workspace with a .herdr-kanban.toml configuration")
+                )
+            )
+          )
+          .when(Boolean(!this.loading && !this.board && !this.noKanbanInSpace && this.error), (d) =>
             d.child(
               v_flex()
                 .flex_1()

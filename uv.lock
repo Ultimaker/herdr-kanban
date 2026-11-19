@@ -130,7 +130,7 @@ wheels = [
 
 [[package]]
 name = "herdr-kanban"
-version = "0.4.8"
+version = "0.4.9"
 source = { virtual = "." }
 
 [package.dev-dependencies]

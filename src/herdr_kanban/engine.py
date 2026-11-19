@@ -432,42 +432,93 @@ class KanbanEngine:
         extra_kwargs: dict[str, Any] = {}
         if ctx.board.priority_field and ctx.board.priority_field != "Priority":
             extra_kwargs["priority_field"] = ctx.board.priority_field
-        if ctx.is_multi_repo:
-            allowed = {(entry.owner.lower(), entry.repo.lower()): alias for alias, entry in ctx.repos.items()}
-            schema, tickets = self.github.fetch_board(
-                project_owner=ctx.board.project_owner,
-                project_number=ctx.board.project_number,
-                column_map=ctx.board.columns,
-                label_filter=ctx.board.label_filter,
-                allowed_repos=allowed,
-                **extra_kwargs,
-            )
-            for t in tickets:
-                if not t.target_repo:
-                    inferred = self._infer_code_entry_from_ticket(
-                        ctx,
-                        ctx.repos.get(t.repo_alias) or next(iter(ctx.repos.values())),
-                        t,
-                    )
-                    t.target_repo = inferred.alias
-        else:
-            schema, tickets = self.github.fetch_board(
-                project_owner=ctx.board.project_owner,
-                project_number=ctx.board.project_number,
-                repo_owner=ctx.repo_owner,
-                repo_name=ctx.repo_name,
-                column_map=ctx.board.columns,
-                label_filter=ctx.board.label_filter,
-                **extra_kwargs,
-            )
+        try:
+            if ctx.is_multi_repo:
+                allowed = {
+                    (entry.owner.lower(), entry.repo.lower()): alias
+                    for alias, entry in ctx.repos.items()
+                }
+                schema, tickets = self.github.fetch_board(
+                    project_owner=ctx.board.project_owner,
+                    project_number=ctx.board.project_number,
+                    column_map=ctx.board.columns,
+                    label_filter=ctx.board.label_filter,
+                    allowed_repos=allowed,
+                    **extra_kwargs,
+                )
+                for t in tickets:
+                    if not t.target_repo:
+                        inferred = self._infer_code_entry_from_ticket(
+                            ctx,
+                            ctx.repos.get(t.repo_alias) or next(iter(ctx.repos.values())),
+                            t,
+                        )
+                        t.target_repo = inferred.alias
+            else:
+                schema, tickets = self.github.fetch_board(
+                    project_owner=ctx.board.project_owner,
+                    project_number=ctx.board.project_number,
+                    repo_owner=ctx.repo_owner,
+                    repo_name=ctx.repo_name,
+                    column_map=ctx.board.columns,
+                    label_filter=ctx.board.label_filter,
+                    **extra_kwargs,
+                )
+        except GitHubError:
+            cached_board = self.load_cached_board(ctx)
+            if cached_board is not None:
+                return cached_board[1], cached_board[2]
+            raise
         populate_dependency_waves(tickets)
         populate_file_overlaps(tickets)
         state.save_board_cache(
             ctx.slug,
             ctx.board.project_number,
             [self._serialize_cached_ticket(t) for t in tickets],
+            schema={
+                "project_id": schema.project_id,
+                "number": schema.number,
+                "title": schema.title,
+                "url": schema.url,
+                "status_field_id": schema.status_field_id,
+                "options_by_name": dict(schema.options_by_name),
+                "priority_field_id": schema.priority_field_id,
+                "priority_options_by_name": dict(schema.priority_options_by_name),
+            },
         )
         return schema, tickets
+
+    def load_cached_board(self, ctx: RepoContext) -> tuple[float, ProjectSchema, list[Ticket]] | None:
+        cached = state.load_board_cache_with_schema(ctx.slug, ctx.board.project_number)
+        if cached is None:
+            return None
+        fetched_at, schema_raw, rows = cached
+        tickets = [self._deserialize_cached_ticket(r) for r in rows if isinstance(r, dict)]
+        populate_dependency_waves(tickets)
+        populate_file_overlaps(tickets)
+        if isinstance(schema_raw, dict):
+            schema = ProjectSchema(
+                project_id=str(schema_raw.get("project_id") or ""),
+                number=int(schema_raw.get("number") or ctx.board.project_number),
+                title=str(schema_raw.get("title") or f"{ctx.display_name} Kanban"),
+                url=str(
+                    schema_raw.get("url")
+                    or f"https://github.com/orgs/{ctx.board.project_owner}/projects/{ctx.board.project_number}"
+                ),
+                status_field_id=str(schema_raw.get("status_field_id") or ""),
+                options_by_name=dict(schema_raw.get("options_by_name") or {}),
+                priority_field_id=str(schema_raw.get("priority_field_id") or ""),
+                priority_options_by_name=dict(schema_raw.get("priority_options_by_name") or {}),
+            )
+        else:
+            schema = ProjectSchema(
+                project_id="",
+                number=ctx.board.project_number,
+                title=f"{ctx.display_name} Kanban",
+                url=f"https://github.com/orgs/{ctx.board.project_owner}/projects/{ctx.board.project_number}",
+                status_field_id="",
+            )
+        return fetched_at, schema, tickets
 
     def load_cached_tickets(self, ctx: RepoContext) -> tuple[float, list[Ticket]] | None:
         cached = state.load_board_cache(ctx.slug, ctx.board.project_number)

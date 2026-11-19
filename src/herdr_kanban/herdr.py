@@ -647,10 +647,18 @@ class HerdrClient:
 
         # 2. Native Herdr-App window (`herdr-app do tab.new`)
         if self.app_available() and not machine:
+            tab_argv = list(agent_argv)
+            if (
+                agent_kind == "agy"
+                and prompt_text
+                and "-i" not in tab_argv
+                and "--prompt-interactive" not in tab_argv
+            ):
+                tab_argv.append("-i")
             tab_payload: dict[str, Any] = {
                 "name": label,
                 "folder": str(worktree_path),
-                "argv": agent_argv,
+                "argv": tab_argv,
                 "task": prompt_text,
             }
             if ws:
