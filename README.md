@@ -60,13 +60,13 @@ runtime dependencies beyond Python 3.11+, `git`, and `gh`.
 Paste this prompt to any coding agent running in your Herdr window:
 
 ```text
-Read ~/.config/herdr-app/AGENTS.md, then add this mod: https://github.com/jellespijker/herdr-kanban
+Read ~/.config/herdr-app/AGENTS.md, then add this mod: https://github.com/Ultimaker/herdr-kanban
 ```
 
 Or install from a terminal:
 
 ```bash
-git clone https://github.com/jellespijker/herdr-kanban.git ~/.local/share/herdr-kanban
+git clone https://github.com/Ultimaker/herdr-kanban.git ~/.local/share/herdr-kanban
 cd ~/.local/share/herdr-kanban
 ./bin/herdr-kanban install-skill
 ./bin/herdr-kanban install-app-mod
@@ -83,7 +83,7 @@ herdr-app check ~/.config/herdr-app/mods/herdr-kanban
 From GitHub:
 
 ```bash
-herdr plugin install jellespijker/herdr-kanban
+herdr plugin install Ultimaker/herdr-kanban
 ```
 
 Or link a local checkout during development:

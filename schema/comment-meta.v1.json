@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/jellespijker/herdr-kanban/schema/comment-meta.v1.json",
+  "$id": "https://github.com/Ultimaker/herdr-kanban/schema/comment-meta.v1.json",
   "title": "herdr-kanban embedded GitHub comment metadata v1",
   "oneOf": [
     {
