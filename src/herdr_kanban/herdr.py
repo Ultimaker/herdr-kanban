@@ -104,10 +104,13 @@ def resolve_agent_argv(agent_kind: str, home: Path | None = None) -> list[str]:
         try:
             raw = json.loads(progs_file.read_text(encoding="utf-8"))
             programs = raw.get("programs") if isinstance(raw, dict) else None
-            entry = programs.get(kind) if isinstance(programs, dict) else None
-            run_cmd = entry.get("run") if isinstance(entry, dict) else None
-            if isinstance(run_cmd, list) and run_cmd and all(isinstance(x, str) for x in run_cmd):
-                return list(run_cmd)
+            if isinstance(programs, dict):
+                lookup_keys = (kind, "antigravity") if kind == "agy" else (kind,)
+                for key in lookup_keys:
+                    entry = programs.get(key)
+                    run_cmd = entry.get("run") if isinstance(entry, dict) else None
+                    if isinstance(run_cmd, list) and run_cmd and all(isinstance(x, str) for x in run_cmd):
+                        return list(run_cmd)
         except (OSError, ValueError):
             pass
     return list(AGENT_ARGV_MAP.get(kind, [kind]))

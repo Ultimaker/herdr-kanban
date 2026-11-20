@@ -18,7 +18,7 @@ from .git_ops import GitClient, GitError
 from .github import GitHubClient, GitHubError, ProjectSchema
 from .herdr import HerdrClient, current_pane_id, current_scope
 from .model import (
-     COLUMN_TITLES,
+    COLUMN_TITLES,
     ClaimMeta,
     Column,
     DepositMeta,
@@ -31,6 +31,7 @@ from .model import (
     is_lease_expired,
     lease_until_iso,
     parse_body_dependencies,
+    parse_semver_sort_key,
     parse_ticket_ref,
     populate_dependency_waves,
     populate_file_overlaps,
@@ -38,6 +39,7 @@ from .model import (
     render_deposit_body,
     render_relay_comment,
     resolve_winning_claim,
+    short_build_version,
     strip_meta,
     utc_now_iso,
     validate_ready_gate,
@@ -432,6 +434,12 @@ class KanbanEngine:
         extra_kwargs: dict[str, Any] = {}
         if ctx.board.priority_field and ctx.board.priority_field != "Priority":
             extra_kwargs["priority_field"] = ctx.board.priority_field
+        if ctx.board.release_trains:
+            extra_kwargs["release_trains"] = ctx.board.release_trains
+        if ctx.board.release_label_prefix != "release:":
+            extra_kwargs["release_label_prefix"] = ctx.board.release_label_prefix
+        if ctx.board.release_baseline_label != "release:baseline":
+            extra_kwargs["release_baseline_label"] = ctx.board.release_baseline_label
         try:
             if ctx.is_multi_repo:
                 allowed = {
@@ -568,13 +576,41 @@ class KanbanEngine:
         done = sum(1 for b in boxes if b.lower() == "x")
         return done, len(boxes)
 
+    @staticmethod
+    def _infer_ticket_trains(ctx: RepoContext, ticket: Ticket) -> list[str]:
+        """Infer which configured release train(s) a ticket targets."""
+        trains_cfg = ctx.board.release_trains
+        if not trains_cfg:
+            return []
+        labels = {str(x).lower() for x in ticket.labels}
+        target_repo = (ticket.target_repo or ticket.repo_alias or ticket.repo_name or "").lower()
+        combined = f"{ticket.title} {ticket.body}".lower()
+        matched: list[str] = []
+        for tid, spec in trains_cfg.items():
+            repo_match = bool(target_repo and target_repo in {r.lower() for r in spec.repos})
+            domain_match = any(
+                (d.lower() if ":" in d else f"domain:{d.lower()}") in labels for d in spec.domains
+            )
+            if repo_match or domain_match:
+                matched.append(tid)
+        if not matched:
+            for tid, spec in trains_cfg.items():
+                if any(kw.lower() in combined for kw in spec.keywords if kw):
+                    matched.append(tid)
+        return matched or [next(iter(trains_cfg))]
+
     def serialize_ticket_for_board(
         self,
         ctx: RepoContext,
         ticket: Ticket,
         local_by_key: dict[tuple[str, int], state.LocalClaim] | None = None,
     ) -> dict[str, Any]:
-        row = ticket.to_dict()
+        trains_cfg = ctx.board.release_trains
+        row = ticket.to_dict(
+            trains=trains_cfg,
+            label_prefix=ctx.board.release_label_prefix,
+            baseline_label=ctx.board.release_baseline_label,
+        )
         row["ref"] = ticket.ref(ctx.is_multi_repo)
         row["cli_ref"] = (
             f"{ticket.repo_alias}#{ticket.number}"
@@ -591,6 +627,16 @@ class KanbanEngine:
         done_cnt, total_cnt = self._checklist_counts(ticket)
         row["checklist_done"] = done_cnt
         row["checklist_total"] = total_cnt
+        if (
+            ticket.column == Column.DONE
+            and not row.get("release_builds")
+            and trains_cfg
+            and not row.get("is_baseline")
+            and not row.get("is_release_ticket")
+        ):
+            row["unreleased_trains"] = self._infer_ticket_trains(ctx, ticket)
+        else:
+            row["unreleased_trains"] = []
         return row
 
     def build_board_payload(
@@ -646,6 +692,10 @@ class KanbanEngine:
             "priorities": list(ctx.board.priorities),
             "milestones": list(ctx.board.milestones),
             "facets": facets_dict,
+            "release_trains": [
+                spec.to_dict(ctx.board.release_label_prefix)
+                for spec in ctx.board.release_trains.values()
+            ],
             "columns": [{"id": col.value, "title": COLUMN_TITLES[col]} for col in Column],
             "settings": {
                 "default_agent_kind": ctx.settings.default_agent_kind,
@@ -656,6 +706,7 @@ class KanbanEngine:
             "local_claims": [c.to_dict() for c in all_local],
             "tickets": [self.serialize_ticket_for_board(ctx, t, local_by_key) for t in tickets],
             "whats_new": self.build_whats_new_digest(ctx, tickets),
+            "changelog": self.build_release_changelog(ctx, tickets),
         }
         return payload
 
@@ -1130,6 +1181,383 @@ class KanbanEngine:
                 lines.append(f"  Summary: {item['summary_note']}")
         return "\n".join(lines)
 
+    @staticmethod
+    def _match_version_index(versions: list[str], query: str) -> int | None:
+        """Resolve a version query (`alpha.4`, `4`, `2.1.0-alpha.4`, `unreleased`) to an index."""
+        q = (query or "").strip().lower().lstrip("v")
+        if not q:
+            return None
+        for idx, ver in enumerate(versions):
+            v_low = ver.lower()
+            v_short = short_build_version(ver).lower()
+            if q in (v_low, v_short):
+                return idx
+        # Match `alpha.<N>` or bare `<N>` against `-alpha.<N>`
+        num_m = re.match(r"^(?:alpha[._-]?)?(\d+)$", q)
+        if num_m:
+            target_alpha = f"alpha.{num_m.group(1)}"
+            for idx, ver in enumerate(versions):
+                v_short = short_build_version(ver).lower()
+                if v_short.endswith(f"-{target_alpha}") or f"-{target_alpha}+" in ver.lower():
+                    return idx
+        for idx, ver in enumerate(versions):
+            if q in ver.lower():
+                return idx
+        return None
+
+    def build_release_changelog(
+        self,
+        ctx: RepoContext,
+        tickets: list[Ticket],
+        *,
+        train: str = "all",
+        from_version: str = "",
+        to_version: str = "",
+        search: str = "",
+        repo: str = "",
+        ticket_type: str = "",
+    ) -> dict[str, Any]:
+        """Build structured changelog across configured or discovered release trains."""
+        trains_cfg = ctx.board.release_trains
+        raw_train = (train or "all").strip().lower()
+        norm_train = raw_train
+        if raw_train != "all":
+            for tid, spec in trains_cfg.items():
+                if spec.matches_token(raw_train):
+                    norm_train = tid
+                    break
+
+        done_tickets = [t for t in tickets if t.column == Column.DONE]
+
+        release_ticket_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        tickets_by_build: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        versions_by_train: dict[str, set[str]] = {tid: set() for tid in trains_cfg}
+
+        companion_re = re.compile(
+            r"Companion Release Ticket\*\*:\s*`?((?:[A-Za-z0-9_.-]+)?#\d+)`?\s*(?:\(`?([^`)\s]+)`?\))?",
+            re.IGNORECASE,
+        )
+        released_at_re = re.compile(r"Released\s*&\s*Deployed\s*\(([^)]+)\)", re.IGNORECASE)
+
+        for t in done_tickets:
+            binfo = t.build_info(
+                trains=trains_cfg,
+                label_prefix=ctx.board.release_label_prefix,
+                baseline_label=ctx.board.release_baseline_label,
+            )
+            builds_map: dict[str, list[str]] = binfo["builds"]
+            primary_map: dict[str, str] = binfo["primary_builds"]
+            ref_str = t.ref(ctx.is_multi_repo)
+            cli_ref = (
+                f"{t.repo_alias}#{t.number}"
+                if (ctx.is_multi_repo and t.repo_alias)
+                else str(t.number)
+            )
+            if binfo["is_release_ticket"]:
+                comp_m = companion_re.search(t.body or "")
+                rel_at_m = released_at_re.search(t.body or "")
+                fallback_date = t.updated_at[:10] if t.updated_at else ""
+                rel_date = rel_at_m.group(1).strip() if rel_at_m else fallback_date
+                rt_meta = {
+                    "number": t.number,
+                    "ref": ref_str,
+                    "cli_ref": cli_ref,
+                    "title": t.title,
+                    "updated_at": t.updated_at,
+                    "released_at": rel_date,
+                    "companion_ref": comp_m.group(1).strip() if comp_m else "",
+                    "companion_version": (comp_m.group(2) or "").strip() if comp_m else "",
+                }
+                for tid, vers in builds_map.items():
+                    for ver in vers:
+                        versions_by_train.setdefault(tid, set()).add(ver)
+                        release_ticket_by_key[(tid, ver)] = rt_meta
+                continue
+
+            clean_title, jira_keys, scopes = self._split_ticket_prefixes(t.title)
+            owner = (
+                (t.claim.owner if t.claim and t.claim.owner else "")
+                or (t.deposit.deposited_by if t.deposit and t.deposit.deposited_by else "")
+                or t.author
+                or "team"
+            )
+            agent = t.claim.agent_kind if t.claim and t.claim.agent_kind else ""
+            repo_key = t.target_repo or t.repo_alias or t.repo_name or ctx.repo_name
+            t_type = next(
+                (lbl.split(":", 1)[1] for lbl in t.labels if lbl.startswith("type:")),
+                "feature",
+            )
+            t_domains = [lbl.split(":", 1)[1] for lbl in t.labels if lbl.startswith("domain:")]
+
+            item = {
+                "number": t.number,
+                "ref": ref_str,
+                "cli_ref": cli_ref,
+                "title": t.title,
+                "clean_title": clean_title,
+                "jira_keys": jira_keys,
+                "scopes": scopes,
+                "target_repo": repo_key,
+                "priority": t.priority,
+                "milestone": t.milestone,
+                "type": t_type,
+                "domains": t_domains,
+                "owner": owner,
+                "agent_kind": agent,
+                "updated_at": t.updated_at,
+                "summary_note": self._extract_ticket_summary_note(t),
+                "labels": list(t.labels),
+                "builds": builds_map,
+                "release_builds": primary_map,
+                "is_baseline": binfo["is_baseline"],
+                "unreleased_trains": [],
+            }
+
+            if builds_map:
+                for tid, vers in builds_map.items():
+                    for ver in vers:
+                        versions_by_train.setdefault(tid, set()).add(ver)
+                        tickets_by_build.setdefault((tid, ver), []).append(item)
+            elif trains_cfg and not binfo["is_baseline"]:
+                inferred = self._infer_ticket_trains(ctx, t)
+                item["unreleased_trains"] = inferred
+                for tr_name in inferred:
+                    versions_by_train.setdefault(tr_name, set())
+                    tickets_by_build.setdefault((tr_name, "unreleased"), []).append(item)
+
+        ordered_train_ids: list[str] = list(trains_cfg.keys())
+        for tid in sorted(versions_by_train):
+            if tid not in ordered_train_ids:
+                ordered_train_ids.append(tid)
+
+        def _train_meta(tid: str) -> dict[str, Any]:
+            spec = trains_cfg.get(tid)
+            if spec is not None:
+                return spec.to_dict(ctx.board.release_label_prefix)
+            title_name = tid.replace("-", " ").replace("_", " ").title()
+            return {
+                "id": tid,
+                "name": title_name,
+                "short_name": title_name,
+                "display_name": title_name,
+                "aliases": [],
+                "label_prefixes": [f"{ctx.board.release_label_prefix}{tid}-".lower()],
+                "project_field": "",
+                "color": "",
+                "repos": [],
+                "domains": [],
+                "keywords": [],
+            }
+
+        sorted_versions_by_train: dict[str, list[str]] = {}
+        for tid in ordered_train_ids:
+            vers = sorted(versions_by_train.get(tid, set()), key=parse_semver_sort_key)
+            if (tid, "unreleased") in tickets_by_build:
+                vers.append("unreleased")
+            sorted_versions_by_train[tid] = vers
+
+        def _filter_version_slice(ver_list: list[str], is_target_train: bool) -> list[str]:
+            if not ver_list or not is_target_train:
+                return []
+            lo = 0
+            hi = len(ver_list) - 1
+            if from_version:
+                m_lo = self._match_version_index(ver_list, from_version)
+                if m_lo is not None:
+                    lo = m_lo
+            if to_version:
+                m_hi = self._match_version_index(ver_list, to_version)
+                if m_hi is not None:
+                    hi = m_hi
+            if lo > hi:
+                lo, hi = hi, lo
+            return ver_list[lo : hi + 1]
+
+        selected_versions_by_train: dict[str, list[str]] = {
+            tid: _filter_version_slice(
+                sorted_versions_by_train[tid],
+                norm_train in ("all", tid),
+            )
+            for tid in ordered_train_ids
+        }
+
+        q_lc = (search or "").strip().lower()
+        repo_lc = (repo or "").strip().lower()
+        type_lc = (ticket_type or "").strip().lower()
+
+        def _item_matches(it: dict[str, Any]) -> bool:
+            if repo_lc and it["target_repo"].lower() != repo_lc:
+                return False
+            if type_lc and type_lc != "all" and it["type"].lower() != type_lc:
+                return False
+            if not q_lc:
+                return True
+            builds_str = " ".join(
+                f"{k} {v}" for k, v in (it.get("release_builds") or {}).items()
+            )
+            haystack = " ".join(
+                [
+                    it["ref"],
+                    str(it["number"]),
+                    it["title"],
+                    it["target_repo"],
+                    builds_str,
+                    " ".join(it["labels"]),
+                    it["owner"],
+                ]
+            ).lower()
+            return q_lc in haystack
+
+        builds_out: list[dict[str, Any]] = []
+        for tid in ordered_train_ids:
+            meta = _train_meta(tid)
+            full_list = sorted_versions_by_train[tid]
+            for ver in reversed(selected_versions_by_train[tid]):
+                ver_idx = full_list.index(ver)
+                prev_ver = full_list[ver_idx - 1] if ver_idx > 0 else "baseline"
+                raw_items = sorted(
+                    tickets_by_build.get((tid, ver), []),
+                    key=lambda x: (self.priority_rank(ctx, x.get("priority", "")), x["number"]),
+                )
+                filtered_items = [it for it in raw_items if _item_matches(it)]
+                if (q_lc or repo_lc or (type_lc and type_lc != "all")) and not filtered_items:
+                    continue
+                rt_info = release_ticket_by_key.get((tid, ver))
+                short_ver = (
+                    "Unreleased (Pending Next Build)"
+                    if ver == "unreleased"
+                    else short_build_version(ver)
+                )
+                prev_short = (
+                    short_build_version(prev_ver) if prev_ver != "baseline" else "baseline"
+                )
+                bugs_cnt = sum(1 for x in filtered_items if x["type"] == "bug")
+                feat_cnt = sum(1 for x in filtered_items if x["type"] == "feature")
+                for_cnt = sum(1 for x in filtered_items if x["type"] == "forensics")
+                other_cnt = len(filtered_items) - bugs_cnt - feat_cnt - for_cnt
+                builds_out.append(
+                    {
+                        "train": tid,
+                        "train_name": meta["name"],
+                        "train_short_name": meta["short_name"],
+                        "train_display": meta["display_name"],
+                        "train_color": meta["color"],
+                        "version": ver,
+                        "short_version": short_ver,
+                        "previous_version": prev_ver,
+                        "previous_short_version": prev_short,
+                        "is_unreleased": ver == "unreleased",
+                        "release_ticket": rt_info,
+                        "tickets": filtered_items,
+                        "total_unfiltered": len(raw_items),
+                        "counts": {
+                            "total": len(filtered_items),
+                            "bugs": bugs_cnt,
+                            "features": feat_cnt,
+                            "forensics": for_cnt,
+                            "other": other_cnt,
+                        },
+                    }
+                )
+
+        # Sort combined builds so newest releases appear first
+        def _build_sort_key(b: dict[str, Any]) -> tuple[int, str, int]:
+            is_unrel = 1 if b["is_unreleased"] else 0
+            rt = b.get("release_ticket") or {}
+            ts = str(rt.get("updated_at") or "")
+            _, _, _, alpha_num, _ = parse_semver_sort_key(b["version"])
+            return (is_unrel, ts, alpha_num)
+
+        builds_out.sort(key=_build_sort_key, reverse=True)
+
+        unique_tickets: dict[int, dict[str, Any]] = {}
+        for b in builds_out:
+            for it in b["tickets"]:
+                unique_tickets[it["number"]] = it
+
+        trains_out: list[dict[str, Any]] = []
+        md_lines: list[str] = [
+            f"# Release & Build Changelog — {ctx.display_name}",
+            "",
+        ]
+        for tid in ordered_train_ids:
+            meta = _train_meta(tid)
+            all_vers = sorted_versions_by_train[tid]
+            rel_vers = [v for v in all_vers if v != "unreleased"]
+            span = (
+                f" (`{short_build_version(rel_vers[0])}` → `{short_build_version(rel_vers[-1])}`)"
+                if rel_vers
+                else ""
+            )
+            trains_out.append(
+                {
+                    **meta,
+                    "versions": all_vers,
+                    "selected_versions": selected_versions_by_train[tid],
+                }
+            )
+            md_lines.append(
+                f"- **{meta['display_name']} (`{tid}`)**: `{len(rel_vers)}` releases{span}"
+            )
+
+        md_lines.extend(
+            [
+                (
+                    "- **Matched Tickets in Selection**: "
+                    f"`{len(unique_tickets)}` ticket(s) across `{len(builds_out)}` build(s)"
+                ),
+                "",
+            ]
+        )
+        for b in builds_out:
+            rt = b.get("release_ticket")
+            rt_suffix = f" ({rt['ref']})" if rt else ""
+            comp_suffix = (
+                f" · Companion: `{short_build_version(rt['companion_version'])}` ({rt['companion_ref']})"
+                if (rt and rt.get("companion_version"))
+                else ""
+            )
+            hdr_ver = (
+                "Unreleased (Merged on Branch — Pending Next Build)"
+                if b["is_unreleased"]
+                else f"`{b['version']}` (since `{b['previous_version']}`)"
+            )
+            tr_upper = b["train"].upper()
+            md_lines.append(f"## [{tr_upper}] {b['train_display']} — {hdr_ver}{rt_suffix}{comp_suffix}")
+            if not b["tickets"]:
+                md_lines.append("- *(Version bump / rebuild with 0 newly collected tickets)*")
+            else:
+                for it in b["tickets"]:
+                    build_tags: list[str] = []
+                    for bt_id, bt_ver in (it.get("release_builds") or {}).items():
+                        bt_meta = _train_meta(bt_id)
+                        build_tags.append(
+                            f"{bt_meta['short_name']}: `{short_build_version(bt_ver)}`"
+                        )
+                    if not build_tags and it.get("unreleased_trains"):
+                        build_tags.append(f"Pending next {'/'.join(it['unreleased_trains'])} build")
+                    btag_str = f" [{', '.join(build_tags)}]" if build_tags else ""
+                    meta_tag = f"(`{it['target_repo']}`, `{it['type']}`, {it['priority'] or '-'})"
+                    md_lines.append(
+                        f"- **[{it['ref']}](kanban://issue/{it['cli_ref']})** {meta_tag} "
+                        f"{it['clean_title']}{btag_str}"
+                    )
+            md_lines.append("")
+
+        return {
+            "train": norm_train,
+            "from_version": from_version,
+            "to_version": to_version,
+            "search": search,
+            "repo": repo,
+            "trains": trains_out,
+            "train_versions": sorted_versions_by_train,
+            "selected_train_versions": selected_versions_by_train,
+            "total_unique_tickets": len(unique_tickets),
+            "builds": builds_out,
+            "markdown": "\n".join(md_lines).strip() + "\n",
+        }
+
 
     def sync_labels(self, ctx: RepoContext) -> dict[str, Any]:
         """Provision configured taxonomy labels, milestones, and Project v2 Priority options."""
@@ -1172,11 +1600,20 @@ class KanbanEngine:
                 project_id=schema.project_id,
             )
 
+        build_fields: list[str] = []
+        if schema.project_id:
+            for spec in ctx.board.release_trains.values():
+                if spec.project_field and spec.project_field.lower() not in schema.text_fields_by_name:
+                    fid = self.github.ensure_text_field(schema.project_id, spec.project_field)
+                    if fid:
+                        build_fields.append(spec.project_field)
+
         return {
             "issues_repo": f"{issues_entry.owner}/{issues_entry.repo}",
             "labels": label_results,
             "milestones": milestone_results,
             "added_priorities": added_priorities,
+            "added_build_fields": build_fields,
         }
 
     def sync_repos(self, ctx: RepoContext, *, create_branches: bool = False) -> list[dict[str, str]]:
@@ -1973,6 +2410,12 @@ class KanbanEngine:
         if target_local is not None:
             target_handle = target_local.agent_name or target_local.pane_id
             delivered_fast = self.herdr.prompt_if_idle(target_handle, wakeup_text)
+            trusted_set = self.github.trusted_collaborators(
+                to_entry.owner,
+                to_entry.repo,
+                ctx.board.trusted_authors,
+            )
+            is_trusted = bool(user and user.lower() in trusted_set)
             state.append_inbox_item(
                 to_entry.slug,
                 InboxItem(
@@ -1984,7 +2427,7 @@ class KanbanEngine:
                     from_agent=from_agent,
                     from_repo=from_repo_alias,
                     from_issue=resolved_from,
-                    trusted=True,
+                    trusted=is_trusted,
                     delivered=delivered_fast,
                 ),
             )
@@ -2535,6 +2978,11 @@ class KanbanEngine:
             priority=str(raw.get("priority") or ""),
             milestone=str(raw.get("milestone") or ""),
             target_repo=str(raw.get("target_repo") or ""),
+            release_builds={
+                str(k): str(v)
+                for k, v in (raw.get("release_builds") or {}).items()
+                if str(k) and str(v)
+            },
             depends_on=[int(x) for x in (raw.get("depends_on") or [])],
             blocks=[int(x) for x in (raw.get("blocks") or [])],
             unmet_deps=[int(x) for x in (raw.get("unmet_deps") or [])],
