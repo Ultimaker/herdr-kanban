@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/Ultimaker/herdr-kanban/schema/board-config.v1.json",
+  "$id": "https://github.com/jellespijker/herdr-kanban/schema/board-config.v1.json",
   "title": "herdr-kanban .herdr-kanban.toml configuration v1",
   "type": "object",
   "required": ["board"],
