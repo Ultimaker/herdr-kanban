@@ -31,7 +31,7 @@ const ACTIVE_COL_MIN_WIDTH = 276;
 const ACTIVE_COL_MAX_WIDTH = 360;
 const EMPTY_COL_COMPACT_WIDTH = 104;
 const UNIFORM_COL_WIDTH = 248;
-const CARD_EST_HEIGHT = 116;
+const CARD_EST_HEIGHT = 124;
 const DEFAULT_PRIORITIES = ["P0", "P1", "P2", "P3"];
 const DEFAULT_AGENTS = ["agy", "claude", "codex", "opencode", "gemini", "copilot"];
 
@@ -326,6 +326,185 @@ function parseFacetLabel(rawLabel, t) {
   return { prefix, text: str, color: t.muted, bg: t.background };
 }
 
+function shortBuildVersion(rawVer) {
+  const s = String(rawVer || "").trim();
+  if (!s) return "";
+  return s.replace(/\+[A-Za-z0-9._-]+$/, "");
+}
+
+function compactAlphaLabel(rawVer) {
+  const s = shortBuildVersion(rawVer);
+  if (!s) return "";
+  if (s === "unreleased") return "Unreleased";
+  const m = /^(\d+\.\d+\.\d+)-alpha\.(\d+)$/i.exec(s);
+  if (m) return `${m[1]}-α${m[2]}`;
+  return s;
+}
+
+function trainAccentColor(trainMeta, idx, t) {
+  const palette = [
+    t.done || t.ansi2 || "#10b981",
+    t.accent || "#4c8bf5",
+    t.ansi5 || "#a855f7",
+    t.working || t.ansi3 || "#d97736",
+  ];
+  const raw = String((trainMeta && trainMeta.color) || "").trim().toLowerCase();
+  if (!raw) return palette[idx % palette.length];
+  if (raw.startsWith("#")) return raw;
+  if (raw === "green" || raw === "done") return t.done || t.ansi2 || "#10b981";
+  if (raw === "cyan" || raw === "blue" || raw === "accent") return t.accent || "#4c8bf5";
+  if (raw === "amber" || raw === "yellow" || raw === "orange") return t.working || t.ansi3 || "#d97736";
+  if (raw === "magenta" || raw === "purple") return t.ansi5 || "#a855f7";
+  if (raw === "red") return t.blocked || t.ansi1 || "#ef4444";
+  return palette[idx % palette.length];
+}
+
+function getTrainMeta(trainId, releaseTrains) {
+  const list = Array.isArray(releaseTrains) ? releaseTrains : [];
+  const low = String(trainId || "").toLowerCase();
+  for (let i = 0; i < list.length; i += 1) {
+    const tr = list[i];
+    if (!tr) continue;
+    const aliases = Array.isArray(tr.aliases) ? tr.aliases.map((a) => String(a).toLowerCase()) : [];
+    if (String(tr.id || "").toLowerCase() === low || aliases.includes(low)) {
+      return { ...tr, _index: i };
+    }
+  }
+  const titleName = String(trainId || "")
+    .replace(/[-_]+/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+  return {
+    id: low || "release",
+    name: titleName || "Release",
+    short_name: titleName || "Rel",
+    display_name: titleName || "Release",
+    color: "",
+    _index: list.length,
+  };
+}
+
+function resolveTicketBuilds(ticket, releaseTrains) {
+  if (!ticket) {
+    return {
+      entries: [],
+      buildsByTrain: {},
+      isBaseline: false,
+      isReleaseTicket: false,
+      unreleasedTrains: [],
+    };
+  }
+  const trainsList = Array.isArray(releaseTrains) ? releaseTrains : [];
+  const setsByTrain = new Map();
+  const addVer = (tid, ver) => {
+    const v = String(ver || "").trim();
+    if (!v) return;
+    const meta = getTrainMeta(tid, trainsList);
+    if (!setsByTrain.has(meta.id)) setsByTrain.set(meta.id, new Set());
+    setsByTrain.get(meta.id).add(v);
+  };
+
+  if (ticket.builds && typeof ticket.builds === "object") {
+    for (const [tid, vers] of Object.entries(ticket.builds)) {
+      if (Array.isArray(vers)) {
+        for (const v of vers) addVer(tid, v);
+      }
+    }
+  }
+  if (ticket.release_builds && typeof ticket.release_builds === "object") {
+    for (const [tid, ver] of Object.entries(ticket.release_builds)) {
+      addVer(tid, ver);
+    }
+  }
+
+  let isBaseline = Boolean(ticket.is_baseline);
+  const titleStr = String(ticket.title || "");
+  const bodyStr = String(ticket.body || "");
+  let isReleaseTicket =
+    Boolean(ticket.is_release_ticket) ||
+    titleStr.toLowerCase().includes("[release]") ||
+    bodyStr.toLowerCase().includes("release-ticket:true");
+
+  const rawLabels = Array.isArray(ticket.labels) ? ticket.labels : [];
+  for (const raw of rawLabels) {
+    const lbl = String(raw || "").trim();
+    const low = lbl.toLowerCase();
+    if (low === "release:baseline") {
+      isBaseline = true;
+      continue;
+    }
+    if (low.startsWith("release:")) {
+      let matched = false;
+      for (const tr of trainsList) {
+        const prefs = Array.isArray(tr.label_prefixes) ? tr.label_prefixes : [`release:${tr.id}-`];
+        for (const pref of prefs) {
+          if (low.startsWith(String(pref).toLowerCase())) {
+            addVer(tr.id, lbl.slice(pref.length));
+            matched = true;
+            break;
+          }
+        }
+        if (matched) break;
+      }
+      if (!matched) {
+        const rest = lbl.slice("release:".length);
+        const dashIdx = rest.indexOf("-");
+        if (dashIdx > 0) {
+          const tok = rest.slice(0, dashIdx);
+          const ver = rest.slice(dashIdx + 1).trim();
+          if (/^\d+\.\d+\.\d+/.test(ver)) {
+            addVer(tok, ver);
+          }
+        }
+      }
+    }
+  }
+
+  const relInRe = /Released-In:.*?\(\s*([A-Za-z0-9_-]+)\s*:\s*`?([0-9]+\.[0-9]+\.[0-9]+[^\s`)]*)`?\s*\)/gi;
+  let m;
+  while ((m = relInRe.exec(bodyStr)) !== null) {
+    addVer(m[1], m[2]);
+  }
+
+  const orderedIds = [];
+  for (const tr of trainsList) {
+    if (setsByTrain.has(tr.id)) orderedIds.push(tr.id);
+  }
+  for (const tid of setsByTrain.keys()) {
+    if (!orderedIds.includes(tid)) orderedIds.push(tid);
+  }
+
+  const entries = [];
+  const buildsByTrain = {};
+  for (const tid of orderedIds) {
+    const vers = Array.from(setsByTrain.get(tid)).filter(Boolean);
+    if (!vers.length) continue;
+    const meta = getTrainMeta(tid, trainsList);
+    buildsByTrain[tid] = vers[0];
+    entries.push({
+      train: tid,
+      name: meta.name,
+      shortName: meta.short_name,
+      displayName: meta.display_name,
+      color: meta.color,
+      index: meta._index,
+      version: vers[0],
+      versions: vers,
+    });
+  }
+
+  const unreleasedTrains = Array.isArray(ticket.unreleased_trains)
+    ? [...ticket.unreleased_trains]
+    : [];
+
+  return {
+    entries,
+    buildsByTrain,
+    isBaseline,
+    isReleaseTicket,
+    unreleasedTrains,
+  };
+}
+
 function stripKanbanMeta(rawBody) {
   if (!rawBody) return "";
   let text = String(rawBody).replace(/<!--\s*herdr-kanban:v1\s+\{[\s\S]*?\}\s*-->/g, "").trim();
@@ -605,7 +784,10 @@ export default class KanbanBoard extends View {
       repoFilter: "",
       quickFilter: "active", // "active" | "all" | "p0"
       compactEmpty: true,
-      viewMode: "board", // "board" | "whats_new"
+      viewMode: "board", // "board" | "changelog" | "whats_new"
+      changelogTrain: "all", // "all" | <train_id>
+      changelogType: "all", // "all" | "bug" | "feature" | "forensics"
+      changelogRanges: {}, // { [trainId]: { from: "", to: "" } }
       agentKind: "agy",
       overrideSpaceId: null,
       showDrawer: true,
@@ -618,7 +800,11 @@ export default class KanbanBoard extends View {
       bus.quickFilter = "active";
       bus.quickFilterMigratedV044 = true;
     }
-    if (props()?.view === "board" || props()?.view === "whats_new") {
+    if (
+      props()?.view === "board" ||
+      props()?.view === "changelog" ||
+      props()?.view === "whats_new"
+    ) {
       bus.viewMode = props().view;
     }
     bus.resolvedCwdBySpace ??= {};
@@ -644,6 +830,9 @@ export default class KanbanBoard extends View {
     this.quickFilter = bus.quickFilter || "active";
     this.compactEmpty = bus.compactEmpty !== false;
     this.viewMode = bus.viewMode || "board";
+    this.changelogTrain = bus.changelogTrain || "all";
+    this.changelogType = bus.changelogType || "all";
+    this.changelogRanges = { ...(bus.changelogRanges || {}) };
     this.agentKind = bus.agentKind;
     this.userPickedAgent = false;
 
@@ -734,6 +923,8 @@ export default class KanbanBoard extends View {
           } else if (cmd === "whats_new" || cmd?.action === "whats_new") {
             this.syncBus({ viewMode: "whats_new" }, cx);
             this.refresh(cx, true);
+          } else if (cmd === "changelog" || cmd?.action === "changelog") {
+            this.syncBus({ viewMode: "changelog" }, cx);
           } else if (cmd === "board" || cmd?.action === "board") {
             this.syncBus({ viewMode: "board" }, cx);
           } else if (cmd === "summarize" || cmd?.action === "summarize") {
@@ -751,7 +942,11 @@ export default class KanbanBoard extends View {
     const seq = Number(nav.seq || 0);
     if (!seq || seq <= this.lastNavSeq) return false;
     this.lastNavSeq = seq;
-    if (nav.viewMode === "board" || nav.viewMode === "whats_new") {
+    if (
+      nav.viewMode === "board" ||
+      nav.viewMode === "changelog" ||
+      nav.viewMode === "whats_new"
+    ) {
       this.syncBus({ viewMode: nav.viewMode }, cx);
     }
     if (nav.selectedRef) {
@@ -788,6 +983,9 @@ export default class KanbanBoard extends View {
       if (patch.viewMode !== undefined) {
         v.viewMode = patch.viewMode;
       }
+      if (patch.changelogTrain !== undefined) v.changelogTrain = patch.changelogTrain;
+      if (patch.changelogType !== undefined) v.changelogType = patch.changelogType;
+      if (patch.changelogRanges !== undefined) v.changelogRanges = { ...patch.changelogRanges };
       if (patch.agentKind !== undefined) {
         v.agentKind = patch.agentKind;
         v.userPickedAgent = true;
@@ -954,12 +1152,15 @@ export default class KanbanBoard extends View {
       const prio = String(t.priority || "").toLowerCase();
       const owner = t.claim && t.claim.owner ? `@${t.claim.owner.toLowerCase()}` : "";
       const labels = Array.isArray(t.labels) ? t.labels.join(" ").toLowerCase() : "";
+      const binfo = resolveTicketBuilds(t, this.board && this.board.release_trains);
+      const buildsStr = binfo.entries.map((e) => `${e.shortName} ${e.version}`).join(" ").toLowerCase();
       return (
         ref.includes(q) ||
         title.includes(q) ||
         prio.includes(q) ||
         owner.includes(q) ||
-        labels.includes(q)
+        labels.includes(q) ||
+        buildsStr.includes(q)
       );
     });
   }
@@ -1604,6 +1805,10 @@ export default class KanbanBoard extends View {
       const nextView = this.viewMode === "whats_new" ? "board" : "whats_new";
       this.syncBus({ viewMode: nextView }, cx);
       cx.stop_propagation();
+    } else if (key === "g") {
+      const nextView = this.viewMode === "changelog" ? "board" : "changelog";
+      this.syncBus({ viewMode: nextView }, cx);
+      cx.stop_propagation();
     } else if (key === "b") {
       this.syncBus({ viewMode: "board" }, cx);
       cx.stop_propagation();
@@ -1699,7 +1904,7 @@ export default class KanbanBoard extends View {
       else closeOverlay(props()?.overlay || "herdr-kanban");
       cx.stop_propagation();
     } else if (key === "escape") {
-      if (this.viewMode === "whats_new") {
+      if (this.viewMode === "whats_new" || this.viewMode === "changelog") {
         this.syncBus({ viewMode: "board" }, cx);
       } else if (this.showDrawer) {
         this.syncBus({ showDrawer: false }, cx);
@@ -1861,6 +2066,46 @@ export default class KanbanBoard extends View {
                             : `${allTickets.length}`
                         )
                     )
+                  )
+              )
+              .child(
+                h_flex()
+                  .id("view-tab-changelog")
+                  .items_center()
+                  .gap(5)
+                  .px(8)
+                  .py(3)
+                  .rounded(5)
+                  .cursor_pointer()
+                  .bg(this.viewMode === "changelog" ? t.selected : t.background)
+                  .text_size(11.5)
+                  .font_medium()
+                  .text_color(this.viewMode === "changelog" ? t.foreground : t.muted)
+                  .hover((s) => s.bg(this.viewMode === "changelog" ? t.selected : t.hover))
+                  .on_click((_ev, cx) => this.syncBus({ viewMode: "changelog" }, cx))
+                  .child(
+                    svg("mods/workspace-chrome/git-branch.svg")
+                      .size(11)
+                      .text_color(this.viewMode === "changelog" ? t.accent : t.muted)
+                  )
+                  .child("Changelog")
+                  .when(
+                    Boolean(
+                      this.board &&
+                        this.board.changelog &&
+                        Array.isArray(this.board.changelog.builds) &&
+                        this.board.changelog.builds.length > 0
+                    ),
+                    (el) =>
+                      el.child(
+                        div()
+                          .px(4)
+                          .rounded(3)
+                          .bg(withAlpha(t.accent, "20") || t.surface)
+                          .text_size(10)
+                          .text_color(t.accent)
+                          .child(String(this.board.changelog.builds.length))
+                      )
                   )
               )
               .child(
@@ -2420,8 +2665,14 @@ export default class KanbanBoard extends View {
     const unmetDeps = Array.isArray(ticket.unmet_deps) ? ticket.unmet_deps : [];
     const blocks = Array.isArray(ticket.blocks) ? ticket.blocks : [];
     const rawLabels = Array.isArray(ticket.labels) ? ticket.labels : [];
+    const buildInfo = resolveTicketBuilds(ticket, this.board && this.board.release_trains);
     const visibleFacets = rawLabels
-      .filter((l) => !l.startsWith("trl:") && !l.startsWith("access:"))
+      .filter(
+        (l) =>
+          !l.startsWith("trl:") &&
+          !l.startsWith("access:") &&
+          !l.startsWith("release:")
+      )
       .slice(0, 2)
       .map((l) => parseFacetLabel(l, t));
     const checkDone = ticket.checklist_done || 0;
@@ -2772,6 +3023,102 @@ export default class KanbanBoard extends View {
           .font_medium()
           .text_color(isDepBlocked && !isSelected ? t.muted : t.foreground)
           .child(cleanTitle)
+      )
+      .when(
+        Boolean(
+          isDoneCol ||
+            buildInfo.entries.length > 0 ||
+            buildInfo.unreleasedTrains.length > 0
+        ),
+        (d) => {
+          const releaseTrains = (this.board && this.board.release_trains) || [];
+          const warnCol = t.working || t.ansi3 || "#d97736";
+          const buildPills = [];
+          for (const entry of buildInfo.entries) {
+            const bCol = trainAccentColor(entry, entry.index, t);
+            const shortVer = shortBuildVersion(entry.version);
+            buildPills.push(
+              h_flex()
+                .id(`card-bld-${entry.train}-${ticket.number}`)
+                .flex_none()
+                .items_center()
+                .gap(3)
+                .px(5)
+                .py(1.5)
+                .rounded(4)
+                .bg(withAlpha(bCol, "1A") || t.background)
+                .border_1()
+                .border_color(withAlpha(bCol, "66") || bCol)
+                .child(div().size(5).rounded_full().bg(bCol))
+                .child(
+                  div()
+                    .text_size(9.5)
+                    .font_semibold()
+                    .text_color(bCol)
+                    .child(`${entry.shortName} ${shortVer}`)
+                )
+            );
+          }
+          if (
+            buildPills.length === 0 &&
+            isDoneCol &&
+            releaseTrains.length > 0 &&
+            !buildInfo.isBaseline &&
+            !buildInfo.isReleaseTicket
+          ) {
+            const trLabel =
+              buildInfo.unreleasedTrains.length > 0
+                ? buildInfo.unreleasedTrains
+                    .map((trId) => getTrainMeta(trId, releaseTrains).short_name)
+                    .join("+")
+                : "Next";
+            buildPills.push(
+              h_flex()
+                .id(`card-unrel-bld-${ticket.number}`)
+                .flex_none()
+                .items_center()
+                .gap(3)
+                .px(5)
+                .py(1.5)
+                .rounded(4)
+                .bg(withAlpha(warnCol, "1A") || t.background)
+                .border_1()
+                .border_color(withAlpha(warnCol, "66") || warnCol)
+                .child(div().size(5).rounded_full().bg(warnCol))
+                .child(
+                  div()
+                    .text_size(9.5)
+                    .font_semibold()
+                    .text_color(warnCol)
+                    .child(`Pending ${trLabel} Build`)
+                )
+            );
+          } else if (buildPills.length === 0 && buildInfo.isBaseline) {
+            buildPills.push(
+              div()
+                .id(`card-base-bld-${ticket.number}`)
+                .flex_none()
+                .px(5)
+                .py(1)
+                .rounded(4)
+                .bg(t.background)
+                .border_1()
+                .border_color(t.border)
+                .text_size(9.5)
+                .text_color(t.dim)
+                .child("Baseline")
+            );
+          }
+          if (buildPills.length === 0) return d;
+          return d.child(
+            h_flex()
+              .w_full()
+              .items_center()
+              .gap(5)
+              .overflow_hidden()
+              .children(buildPills)
+          );
+        }
       )
       .when(cardFacetItems.length > 0, (d) =>
         d.child(
@@ -3615,6 +3962,46 @@ export default class KanbanBoard extends View {
                             .text_color(t.foreground)
                             .child(item.clean_title || item.title)
                         )
+                        .when(
+                          Boolean(Array.isArray(item.releases) && item.releases.length > 0),
+                          (relRow) =>
+                            relRow.child(
+                              h_flex()
+                                .w_full()
+                                .items_center()
+                                .gap(5)
+                                .overflow_hidden()
+                                .children(
+                                  item.releases.slice(0, 3).map((relStr, rIdx) => {
+                                    const releaseTrains = (this.board && this.board.release_trains) || [];
+                                    const strVal = String(relStr || "");
+                                    const dashIdx = strVal.indexOf("-");
+                                    const tok = dashIdx > 0 ? strVal.slice(0, dashIdx) : "";
+                                    const ver = dashIdx > 0 ? strVal.slice(dashIdx + 1) : strVal;
+                                    const meta = tok ? getTrainMeta(tok, releaseTrains) : null;
+                                    const col = meta
+                                      ? trainAccentColor(meta, meta._index, t)
+                                      : t.done || t.ansi2;
+                                    const cleanRel = meta
+                                      ? `${meta.short_name} ${shortBuildVersion(ver)}`
+                                      : shortBuildVersion(strVal);
+                                    return div()
+                                      .id(`wn-rel-${idx}-${rIdx}`)
+                                      .flex_none()
+                                      .px(5)
+                                      .py(1)
+                                      .rounded(4)
+                                      .bg(withAlpha(col, "18") || t.background)
+                                      .border_1()
+                                      .border_color(withAlpha(col, "60") || col)
+                                      .text_size(9.5)
+                                      .font_semibold()
+                                      .text_color(col)
+                                      .child(cleanRel);
+                                  })
+                                )
+                            )
+                        )
                         .when(Boolean(item.summary_note), (sn) =>
                           sn.child(
                             div()
@@ -3631,6 +4018,697 @@ export default class KanbanBoard extends View {
                     )
                   )
               )
+          )
+      );
+  }
+
+  jumpToBuildChangelog(train, version, cx) {
+    if (!train || !version) return;
+    const nextRanges = {
+      ...(this.changelogRanges || {}),
+      [train]: { from: version, to: version },
+    };
+    this.syncBus(
+      {
+        viewMode: "changelog",
+        changelogTrain: train,
+        changelogRanges: nextRanges,
+      },
+      cx
+    );
+  }
+
+  toggleVersionRangeChip(train, version, versionList, cx) {
+    const prev = (this.changelogRanges && this.changelogRanges[train]) || {};
+    const curFrom = prev.from || "";
+    const curTo = prev.to || "";
+    const setRange = (from, to) => {
+      const nextRanges = { ...(this.changelogRanges || {}), [train]: { from, to } };
+      this.syncBus({ changelogRanges: nextRanges }, cx);
+    };
+
+    if (!curFrom && !curTo) {
+      setRange(version, version);
+      return;
+    }
+    if (curFrom === version && curTo === version) {
+      setRange("", "");
+      return;
+    }
+    const idxClick = versionList.indexOf(version);
+    const idxFrom = curFrom ? versionList.indexOf(curFrom) : 0;
+    if (idxClick < 0) return;
+
+    if (curFrom === curTo) {
+      const lo = Math.min(idxFrom, idxClick);
+      const hi = Math.max(idxFrom, idxClick);
+      setRange(versionList[lo], versionList[hi]);
+    } else {
+      setRange(version, version);
+    }
+  }
+
+  renderChangelogView(t) {
+    const cl = (this.board && this.board.changelog) || {};
+    const trainsList = Array.isArray(cl.trains)
+      ? cl.trains
+      : Array.isArray(this.board && this.board.release_trains)
+        ? this.board.release_trains
+        : [];
+    const trainVersionsMap = (cl.train_versions && typeof cl.train_versions === "object")
+      ? cl.train_versions
+      : {};
+    const allBuilds = Array.isArray(cl.builds) ? cl.builds : [];
+    const trainFilter = this.changelogTrain || "all";
+    const typeFilter = this.changelogType || "all";
+    const ranges = this.changelogRanges || {};
+    const q = (this.searchQuery || "").toLowerCase();
+    const repoFlt = (this.repoFilter || "").toLowerCase();
+    const warnCol = t.working || t.ansi3 || "#d97736";
+
+    const inRange = (ver, verList, rawFrom, rawTo) => {
+      if (!verList.length) return true;
+      const idx = verList.indexOf(ver);
+      if (idx < 0) return true;
+      const lo = rawFrom && verList.indexOf(rawFrom) >= 0 ? verList.indexOf(rawFrom) : 0;
+      const hi =
+        rawTo && verList.indexOf(rawTo) >= 0 ? verList.indexOf(rawTo) : verList.length - 1;
+      const minIdx = Math.min(lo, hi);
+      const maxIdx = Math.max(lo, hi);
+      return idx >= minIdx && idx <= maxIdx;
+    };
+
+    const filteredBuilds = [];
+    const uniqueTicketsMap = new Map();
+    for (const bld of allBuilds) {
+      if (trainFilter !== "all" && bld.train !== trainFilter) continue;
+      const tVers = Array.isArray(trainVersionsMap[bld.train]) ? trainVersionsMap[bld.train] : [];
+      const tRange = ranges[bld.train] || {};
+      if (!inRange(bld.version, tVers, tRange.from || "", tRange.to || "")) {
+        continue;
+      }
+      const rawItems = Array.isArray(bld.tickets) ? bld.tickets : [];
+      const matchedItems = rawItems.filter((it) => {
+        if (repoFlt && String(it.target_repo || "").toLowerCase() !== repoFlt) return false;
+        if (typeFilter !== "all" && String(it.type || "").toLowerCase() !== typeFilter) {
+          return false;
+        }
+        if (!q) return true;
+        const bStr = Object.entries(it.release_builds || {})
+          .map(([k, v]) => `${k} ${v}`)
+          .join(" ");
+        const hay = `${it.ref} #${it.number} ${it.title} ${it.target_repo} ${bStr} ${(
+          it.labels || []
+        ).join(" ")} @${it.owner || ""}`.toLowerCase();
+        return hay.includes(q);
+      });
+      if ((q || repoFlt || typeFilter !== "all") && matchedItems.length === 0) {
+        continue;
+      }
+      for (const it of matchedItems) {
+        uniqueTicketsMap.set(it.number, it);
+      }
+      filteredBuilds.push({
+        ...bld,
+        matchedItems,
+      });
+    }
+
+    const uniqueTickets = Array.from(uniqueTicketsMap.values());
+    const totalBugs = uniqueTickets.filter((x) => x.type === "bug").length;
+    const totalFeatures = uniqueTickets.filter((x) => x.type === "feature").length;
+    const totalForensics = uniqueTickets.filter((x) => x.type === "forensics").length;
+    const hasAnyRange = Object.values(ranges).some((r) => Boolean(r && (r.from || r.to)));
+    const hasCustomRange = Boolean(
+      hasAnyRange || trainFilter !== "all" || typeFilter !== "all"
+    );
+
+    const renderVersionSelectorRow = (trainKey, label, versions, rawFrom, rawTo, accentCol) => {
+      if (!versions.length) return null;
+      const loIdx = rawFrom && versions.indexOf(rawFrom) >= 0 ? versions.indexOf(rawFrom) : 0;
+      const hiIdx =
+        rawTo && versions.indexOf(rawTo) >= 0 ? versions.indexOf(rawTo) : versions.length - 1;
+      const minIdx = Math.min(loIdx, hiIdx);
+      const maxIdx = Math.max(loIdx, hiIdx);
+      const isFiltered = Boolean(rawFrom || rawTo);
+      const rangeText = isFiltered
+        ? minIdx === maxIdx
+          ? shortBuildVersion(versions[minIdx])
+          : `${shortBuildVersion(versions[minIdx])} → ${shortBuildVersion(versions[maxIdx])}`
+        : `All (${versions.length})`;
+
+      return h_flex()
+        .id(`cl-range-row-${trainKey}`)
+        .w_full()
+        .flex_none()
+        .items_center()
+        .gap(6)
+        .px(14)
+        .py(5)
+        .bg(t.surface)
+        .border_b(1)
+        .border_color(t.border)
+        .child(
+          h_flex()
+            .flex_none()
+            .w(158)
+            .items_center()
+            .justify_between()
+            .gap(4)
+            .child(
+              h_flex()
+                .items_center()
+                .gap(5)
+                .child(div().size(6).rounded_full().bg(accentCol))
+                .child(
+                  div()
+                    .text_size(11)
+                    .font_semibold()
+                    .text_color(t.foreground)
+                    .child(label)
+                )
+            )
+            .child(
+              div()
+                .px(5)
+                .py(1)
+                .rounded(4)
+                .bg(withAlpha(accentCol, "18") || t.background)
+                .text_size(9.5)
+                .font_semibold()
+                .text_color(accentCol)
+                .child(truncStr(rangeText, 19))
+            )
+        )
+        .child(
+          renderChunkedPillRows(
+            versions.map((ver, vIdx) => {
+              const inSel = vIdx >= minIdx && vIdx <= maxIdx;
+              const isEndpoint = isFiltered && (vIdx === minIdx || vIdx === maxIdx);
+              const chipLbl =
+                ver === "unreleased"
+                  ? "Unreleased"
+                  : shortBuildVersion(ver).replace(/^\d+\.\d+\.\d+-alpha\./, "α");
+              return {
+                chars: chipLbl.length + 1,
+                el: div()
+                  .id(`cl-ver-${trainKey}-${vIdx}`)
+                  .flex_none()
+                  .px(6)
+                  .py(1.5)
+                  .rounded(4)
+                  .cursor_pointer()
+                  .bg(
+                    isEndpoint
+                      ? withAlpha(accentCol, "32") || t.selected
+                      : inSel && isFiltered
+                      ? withAlpha(accentCol, "18") || t.selected
+                      : t.background
+                  )
+                  .border_1()
+                  .border_color(
+                    isEndpoint
+                      ? accentCol
+                      : inSel && isFiltered
+                      ? withAlpha(accentCol, "70") || accentCol
+                      : t.border
+                  )
+                  .text_size(10)
+                  .font_semibold()
+                  .text_color(inSel ? (isFiltered ? accentCol : t.foreground) : t.dim)
+                  .hover((s) => s.bg(t.hover))
+                  .on_click((_ev, cx) =>
+                    this.toggleVersionRangeChip(trainKey, ver, versions, cx)
+                  )
+                  .child(chipLbl),
+              };
+            }),
+            82,
+            4,
+            4
+          )
+        );
+    };
+
+    return v_flex()
+      .id("changelog-root")
+      .flex_1()
+      .min_h(0)
+      .w_full()
+      .bg(t.background)
+      .overflow_hidden()
+      .child(
+        // Top Controls Bar: Train Filter + Type Filter + Reset
+        h_flex()
+          .w_full()
+          .h(38)
+          .flex_none()
+          .items_center()
+          .justify_between()
+          .gap(8)
+          .px(14)
+          .bg(t.surface)
+          .border_b(1)
+          .border_color(t.border)
+          .child(
+            h_flex()
+              .items_center()
+              .gap(6)
+              .child(
+                div()
+                  .text_size(12)
+                  .font_semibold()
+                  .text_color(t.foreground)
+                  .child("Build Changelog & Fix Availability")
+              )
+              .child(
+                h_flex()
+                  .items_center()
+                  .gap(3)
+                  .p(2)
+                  .rounded(6)
+                  .bg(t.background)
+                  .border_1()
+                  .border_color(t.border)
+                  .children(
+                    [
+                      { id: "all", label: "All Trains" },
+                      ...trainsList.map((tr) => {
+                        const vers = Array.isArray(tr.versions)
+                          ? tr.versions
+                          : Array.isArray(trainVersionsMap[tr.id])
+                            ? trainVersionsMap[tr.id]
+                            : [];
+                        return { id: tr.id, label: `${tr.name || tr.id} (${vers.length})` };
+                      }),
+                    ].map((tr) => {
+                      const active = trainFilter === tr.id;
+                      return div()
+                        .id(`cl-train-${tr.id}`)
+                        .px(7)
+                        .py(2)
+                        .rounded(4)
+                        .cursor_pointer()
+                        .bg(active ? t.selected : t.background)
+                        .text_size(10.5)
+                        .font_medium()
+                        .text_color(active ? t.accent : t.muted)
+                        .on_click((_ev, cx) =>
+                          this.syncBus({ changelogTrain: tr.id }, cx)
+                        )
+                        .child(tr.label);
+                    })
+                  )
+              )
+          )
+          .child(
+            h_flex()
+              .items_center()
+              .gap(5)
+              .child(
+                h_flex()
+                  .items_center()
+                  .gap(3)
+                  .p(2)
+                  .rounded(6)
+                  .bg(t.background)
+                  .border_1()
+                  .border_color(t.border)
+                  .children(
+                    [
+                      { id: "all", label: "All Types" },
+                      { id: "bug", label: `Bugs (${totalBugs})` },
+                      { id: "feature", label: `Features (${totalFeatures})` },
+                      { id: "forensics", label: `Forensics (${totalForensics})` },
+                    ].map((tp) => {
+                      const active = typeFilter === tp.id;
+                      return div()
+                        .id(`cl-type-${tp.id}`)
+                        .px(6)
+                        .py(2)
+                        .rounded(4)
+                        .cursor_pointer()
+                        .bg(active ? t.selected : t.background)
+                        .text_size(10)
+                        .font_medium()
+                        .text_color(active ? t.foreground : t.muted)
+                        .on_click((_ev, cx) =>
+                          this.syncBus({ changelogType: tp.id }, cx)
+                        )
+                        .child(tp.label);
+                    })
+                  )
+              )
+              .when(hasCustomRange, (el) =>
+                el.child(
+                  btn("cl-reset-range", "Reset Range", t, {
+                    small: true,
+                    onClick: (_ev, cx) =>
+                      this.syncBus(
+                        {
+                          changelogTrain: "all",
+                          changelogType: "all",
+                          changelogRanges: {},
+                        },
+                        cx
+                      ),
+                  })
+                )
+              )
+          )
+      )
+      .children(
+        trainsList
+          .filter((tr) => trainFilter === "all" || trainFilter === tr.id)
+          .map((tr, idx) => {
+            const vers = Array.isArray(tr.versions)
+              ? tr.versions
+              : Array.isArray(trainVersionsMap[tr.id])
+                ? trainVersionsMap[tr.id]
+                : [];
+            const r = ranges[tr.id] || {};
+            return renderVersionSelectorRow(
+              tr.id,
+              tr.name || tr.id,
+              vers,
+              r.from || "",
+              r.to || "",
+              trainAccentColor(tr, idx, t)
+            );
+          })
+          .filter(Boolean)
+      )
+      .child(
+        // Scrollable Build-by-Build Feed
+        v_flex()
+          .id("changelog-scroll-body")
+          .flex_1()
+          .min_h(0)
+          .w_full()
+          .overflow_y_scrollbar()
+          .p(14)
+          .gap(12)
+          .child(
+            // Range & Search Summary Callout
+            h_flex()
+              .w_full()
+              .flex_none()
+              .items_center()
+              .justify_between()
+              .px(12)
+              .py(8)
+              .rounded(7)
+              .bg(t.surface)
+              .border_1()
+              .border_color(q ? t.accent : t.border)
+              .child(
+                h_flex()
+                  .items_center()
+                  .gap(8)
+                  .child(
+                    div()
+                      .text_size(11.5)
+                      .font_semibold()
+                      .text_color(t.foreground)
+                      .child(
+                        q
+                          ? `Fix Lookup "${this.searchQuery}": ${uniqueTickets.length} matching ticket(s) across ${filteredBuilds.length} build(s)`
+                          : `Showing ${uniqueTickets.length} unique ticket(s) across ${filteredBuilds.length} build(s)`
+                      )
+                  )
+                  .child(
+                    div()
+                      .text_size(10.5)
+                      .text_color(t.muted)
+                      .child(
+                        `(${totalBugs} bug fixes · ${totalFeatures} features · ${totalForensics} forensics — click two version chips above to compare any build range)`
+                      )
+                  )
+              )
+          )
+          .when(filteredBuilds.length === 0, (el) =>
+            el.child(
+              v_flex()
+                .w_full()
+                .py(28)
+                .items_center()
+                .justify_center()
+                .child(
+                  div()
+                    .text_size(12)
+                    .text_color(t.dim)
+                    .child("No builds or tickets match the current filter / version range.")
+                )
+            )
+          )
+          .children(
+            filteredBuilds.map((bld, bIdx) => {
+              const tMeta = getTrainMeta(bld.train, trainsList);
+              const isUnrel = Boolean(bld.is_unreleased);
+              const bCol = isUnrel
+                ? warnCol
+                : trainAccentColor(
+                    { color: bld.train_color || tMeta.color },
+                    tMeta._index,
+                    t
+                  );
+              const rt = bld.release_ticket || null;
+              const items = bld.matchedItems || [];
+              const badgeTitle = `${String(bld.train_name || tMeta.name || bld.train).toUpperCase()} BUILD`;
+
+              return v_flex()
+                .id(`cl-build-card-${bIdx}`)
+                .w_full()
+                .flex_none()
+                .rounded(8)
+                .bg(t.surface)
+                .border_1()
+                .border_color(withAlpha(bCol, "66") || t.border)
+                .overflow_hidden()
+                .child(
+                  // Build Section Header
+                  h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap(8)
+                    .px(12)
+                    .py(8)
+                    .bg(withAlpha(bCol, "14") || t.chrome)
+                    .border_b(1)
+                    .border_color(t.border)
+                    .child(
+                      h_flex()
+                        .items_center()
+                        .gap(8)
+                        .child(
+                          div()
+                            .px(6)
+                            .py(2)
+                            .rounded(4)
+                            .bg(withAlpha(bCol, "24") || t.background)
+                            .text_size(10.5)
+                            .font_semibold()
+                            .text_color(bCol)
+                            .child(badgeTitle)
+                        )
+                        .child(
+                          div()
+                            .text_size(12.5)
+                            .font_semibold()
+                            .text_color(t.foreground)
+                            .child(
+                              isUnrel
+                                ? `${bld.train_display} — Unreleased (Merged on Branch, Pending Next Build)`
+                                : `${bld.train_display} ${bld.version}`
+                            )
+                        )
+                        .when(Boolean(!isUnrel && bld.previous_short_version), (pv) =>
+                          pv.child(
+                            div()
+                              .text_size(10.5)
+                              .text_color(t.muted)
+                              .child(`(since ${bld.previous_short_version})`)
+                          )
+                        )
+                    )
+                    .child(
+                      h_flex()
+                        .items_center()
+                        .gap(6)
+                        .when(Boolean(rt && rt.companion_version), (cp) =>
+                          cp.child(
+                            div()
+                              .px(6)
+                              .py(1.5)
+                              .rounded(4)
+                              .bg(t.background)
+                              .border_1()
+                              .border_color(t.border)
+                              .text_size(10)
+                              .text_color(t.accent)
+                              .child(
+                                `Companion: ${shortBuildVersion(rt.companion_version)}`
+                              )
+                          )
+                        )
+                        .when(Boolean(rt && rt.ref), (r) =>
+                          r.child(
+                            div()
+                              .id(`cl-rt-link-${bIdx}`)
+                              .px(6)
+                              .py(1.5)
+                              .rounded(4)
+                              .cursor_pointer()
+                              .bg(t.background)
+                              .border_1()
+                              .border_color(t.border)
+                              .text_size(10)
+                              .text_color(t.accent)
+                              .hover((s) => s.bg(t.hover))
+                              .on_click((_ev, cx) =>
+                                this.selectTicketByRef(rt.cli_ref || rt.ref, cx)
+                              )
+                              .child(`Release ${rt.ref}`)
+                          )
+                        )
+                        .child(
+                          div()
+                            .px(6)
+                            .py(1.5)
+                            .rounded(4)
+                            .bg(t.background)
+                            .text_size(10)
+                            .font_semibold()
+                            .text_color(t.muted)
+                            .child(`${items.length} ticket(s)`)
+                        )
+                    )
+                )
+                .child(
+                  // Tickets inside this Build
+                  v_flex()
+                    .w_full()
+                    .p(10)
+                    .gap(6)
+                    .when(items.length === 0, (emptyEl) =>
+                      emptyEl.child(
+                        div()
+                          .text_size(11)
+                          .text_color(t.dim)
+                          .child("Version bump / rebuild with 0 newly collected tickets.")
+                      )
+                    )
+                    .children(
+                      items.map((it, tIdx) => {
+                        const isBug = it.type === "bug" || it.type === "forensics";
+                        const typeCol = isBug
+                          ? t.blocked || t.ansi1
+                          : t.working || t.ansi3;
+                        return h_flex()
+                          .id(`cl-item-${bIdx}-${tIdx}`)
+                          .w_full()
+                          .items_center()
+                          .justify_between()
+                          .gap(8)
+                          .px(9)
+                          .py(6)
+                          .rounded(6)
+                          .cursor_pointer()
+                          .bg(t.background)
+                          .border_1()
+                          .border_color(t.border)
+                          .hover((s) => s.bg(t.hover))
+                          .on_click((_ev, cx) => this.selectTicketByRef(it.cli_ref, cx))
+                          .child(
+                            h_flex()
+                              .items_center()
+                              .gap(6)
+                              .min_w(0)
+                              .flex_1()
+                              .child(
+                                div()
+                                  .flex_none()
+                                  .text_size(11)
+                                  .font_semibold()
+                                  .text_color(t.accent)
+                                  .child(it.ref)
+                              )
+                              .when(Boolean(it.priority), (p) =>
+                                p.child(
+                                  div()
+                                    .flex_none()
+                                    .px(4)
+                                    .py(0.5)
+                                    .rounded(3)
+                                    .bg(t.surface)
+                                    .text_size(9.5)
+                                    .font_semibold()
+                                    .text_color(priorityColor(it.priority, t))
+                                    .child(it.priority)
+                                )
+                              )
+                              .child(
+                                div()
+                                  .flex_none()
+                                  .px(5)
+                                  .py(0.5)
+                                  .rounded(3)
+                                  .bg(withAlpha(typeCol, "18") || t.surface)
+                                  .text_size(9.5)
+                                  .text_color(typeCol)
+                                  .child(it.type || "feature")
+                              )
+                              .when(Boolean(it.target_repo), (rp) =>
+                                rp.child(
+                                  div()
+                                    .flex_none()
+                                    .px(5)
+                                    .py(0.5)
+                                    .rounded(3)
+                                    .bg(t.surface)
+                                    .text_size(9.5)
+                                    .text_color(t.muted)
+                                    .child(it.target_repo)
+                                )
+                              )
+                              .child(
+                                div()
+                                  .flex_1()
+                                  .min_w(0)
+                                  .text_size(11.5)
+                                  .text_color(t.foreground)
+                                  .truncate()
+                                  .child(it.clean_title || it.title)
+                              )
+                          )
+                          .child(
+                            h_flex()
+                              .items_center()
+                              .flex_none()
+                              .gap(4)
+                              .children(
+                                Object.entries(it.release_builds || {}).map(([trId, ver]) => {
+                                  const meta = getTrainMeta(trId, trainsList);
+                                  const col = trainAccentColor(meta, meta._index, t);
+                                  return div()
+                                    .px(5)
+                                    .py(1)
+                                    .rounded(4)
+                                    .bg(withAlpha(col, "18") || t.surface)
+                                    .border_1()
+                                    .border_color(withAlpha(col, "60") || col)
+                                    .text_size(9.5)
+                                    .font_semibold()
+                                    .text_color(col)
+                                    .child(`${meta.short_name} ${shortBuildVersion(ver)}`);
+                                })
+                              )
+                          );
+                      })
+                    )
+                );
+            })
           )
       );
   }
@@ -4686,21 +5764,89 @@ export default class KanbanBoard extends View {
                           .text_color(t.muted)
                           .child("Specification & Notes")
                       )
+                      .when(
+                        Boolean(
+                          isDoneTicket ||
+                            resolveTicketBuilds(ticket, this.board && this.board.release_trains)
+                              .entries.length > 0
+                        ),
+                        (bRow) => {
+                          const releaseTrains = (this.board && this.board.release_trains) || [];
+                          const bi = resolveTicketBuilds(ticket, releaseTrains);
+                          const warnCol = t.working || t.ansi3 || "#d97736";
+                          return bRow
+                            .children(
+                              bi.entries.map((entry) => {
+                                const col = trainAccentColor(entry, entry.index, t);
+                                return div()
+                                  .id(`insp-bld-pill-${entry.train}`)
+                                  .flex_none()
+                                  .px(6)
+                                  .py(1)
+                                  .rounded(4)
+                                  .cursor_pointer()
+                                  .bg(withAlpha(col, "1C") || t.background)
+                                  .border_1()
+                                  .border_color(withAlpha(col, "70") || col)
+                                  .text_size(10)
+                                  .font_semibold()
+                                  .text_color(col)
+                                  .hover((s) => s.bg(t.hover))
+                                  .on_click((_ev, cx) =>
+                                    this.jumpToBuildChangelog(entry.train, entry.version, cx)
+                                  )
+                                  .child(`${entry.name} Build: ${shortBuildVersion(entry.version)}`);
+                              })
+                            )
+                            .when(
+                              Boolean(
+                                isDoneTicket &&
+                                  bi.entries.length === 0 &&
+                                  releaseTrains.length > 0 &&
+                                  !bi.isBaseline &&
+                                  !bi.isReleaseTicket
+                              ),
+                              (el) =>
+                                el.child(
+                                  div()
+                                    .id("insp-pending-build-pill")
+                                    .flex_none()
+                                    .px(6)
+                                    .py(1)
+                                    .rounded(4)
+                                    .cursor_pointer()
+                                    .bg(withAlpha(warnCol, "1C") || t.background)
+                                    .border_1()
+                                    .border_color(withAlpha(warnCol, "70") || warnCol)
+                                    .text_size(10)
+                                    .font_semibold()
+                                    .text_color(warnCol)
+                                    .on_click((_ev, cx) =>
+                                      this.syncBus({ viewMode: "changelog" }, cx)
+                                    )
+                                    .child("Build: Merged (Pending Next Release Build)")
+                                )
+                            );
+                        }
+                      )
                       .when(Array.isArray(ticket.labels) && ticket.labels.length > 0, (l) =>
                         l.children(
-                          ticket.labels.slice(0, 5).map((lbl, idx) => {
-                            const fc = parseFacetLabel(lbl, t);
-                            return div()
-                              .id(`desc-lbl-${idx}`)
-                              .flex_none()
-                              .px(5)
-                              .py(1)
-                              .rounded(4)
-                              .bg(fc.bg)
-                              .text_size(9.5)
-                              .text_color(fc.color)
-                              .child(truncStr(lbl, 20));
-                          })
+                          ticket.labels
+                            .filter((lbl) => !String(lbl).startsWith("release:"))
+                            .slice(0, 5)
+                            .map((lbl, idx) => {
+                              const fc = parseFacetLabel(lbl, t);
+                              return div()
+                                .id(`desc-lbl-${idx}`)
+                                .flex_none()
+                                .px(5)
+                                .py(1)
+                                .rounded(4)
+                                .bg(fc.bg)
+                                .text_size(9.5)
+                                .text_color(fc.color)
+                                .child(truncStr(lbl, 20));
+                            })
                         )
                       )
                   )
@@ -4743,11 +5889,19 @@ export default class KanbanBoard extends View {
       this.viewMode === "whats_new"
         ? [
             ["s", "summarize"],
+            ["g", "changelog"],
             ["b", "board"],
+            ["r", "refresh"],
+          ]
+        : this.viewMode === "changelog"
+        ? [
+            ["b", "board"],
+            ["w", "what's new"],
             ["r", "refresh"],
           ]
         : [
             ["hjkl", "nav"],
+            ["g", "changelog"],
             ["w", "what's new"],
             ["n", "deposit"],
           ];
@@ -4872,6 +6026,9 @@ export default class KanbanBoard extends View {
       this.quickFilter = this.bus.quickFilter || "active";
       this.compactEmpty = this.bus.compactEmpty !== false;
       this.viewMode = this.bus.viewMode || "board";
+      this.changelogTrain = this.bus.changelogTrain || "all";
+      this.changelogType = this.bus.changelogType || "all";
+      this.changelogRanges = { ...(this.bus.changelogRanges || {}) };
       this.agentKind = this.bus.agentKind;
       this.overrideSpaceId = this.bus.overrideSpaceId;
       this.showDrawer = this.bus.showDrawer !== false;
@@ -5014,12 +6171,21 @@ export default class KanbanBoard extends View {
           .when(Boolean(this.board && this.viewMode === "whats_new"), (d) =>
             d.child(this.renderWhatsNewView(t))
           )
-          .when(Boolean(this.board && this.viewMode !== "whats_new"), (d) =>
-            d
-              .when(!this.showDrawer || !this.drawerTall, (col) =>
-                col.child(this.renderBoardCanvas(byCol, selectedRef, t))
-              )
-              .child(this.renderInspector(selected, t))
+          .when(Boolean(this.board && this.viewMode === "changelog"), (d) =>
+            d.child(this.renderChangelogView(t))
+          )
+          .when(
+            Boolean(
+              this.board &&
+                this.viewMode !== "whats_new" &&
+                this.viewMode !== "changelog"
+            ),
+            (d) =>
+              d
+                .when(!this.showDrawer || !this.drawerTall, (col) =>
+                  col.child(this.renderBoardCanvas(byCol, selectedRef, t))
+                )
+                .child(this.renderInspector(selected, t))
           )
       )
       .child(this.renderFooter(t, tgt));

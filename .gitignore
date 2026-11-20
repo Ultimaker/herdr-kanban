@@ -10,3 +10,4 @@ dist/
 *.egg-info/
 mods/*/*.d.ts
 mods/*/jsconfig.json
+/worktrees/

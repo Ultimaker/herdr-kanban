@@ -22,7 +22,10 @@ herdr-kanban board                                     # overview of columns, pr
 herdr-kanban board --json                              # full structured board payload for agents & Herdr-App GPUI mod
 herdr-kanban list --column ready --unblocked           # unblocked Ready tickets safe to claim in parallel now
 herdr-kanban list -l domain:auth -p P0                 # filter by facet label and Project Priority
-herdr-kanban show 42                                   # inspect priority, milestone, labels, deps, and claim
+herdr-kanban show 42                                   # inspect priority, milestone, release builds, labels, deps, and claim
+herdr-kanban changelog                                 # build-by-build changelog across configured/discovered release trains
+herdr-kanban changelog app --from alpha.2 --to alpha.8 # compare two builds on a release train
+herdr-kanban changelog --search "auth"                 # find which release build includes a specific fix
 herdr-kanban whats-new                                 # view Executive Briefing of landed work by colleagues & agents
 herdr-kanban whats-new --generate                      # synthesize & save What's New briefing from Done tickets + Git log
 herdr-kanban whats-new --write-summary "## Highlights..." --author jelle --agent claude

@@ -18,7 +18,7 @@ from .engine import (
     KanbanError,
     RepoContext,
 )
-from .model import Column, Ticket, strip_meta
+from .model import Column, Ticket, short_build_version, strip_meta
 
 UI_GROUPS: tuple[tuple[str, tuple[Column, ...]], ...] = (
     ("Triage", (Column.TRIAGE,)),
@@ -382,7 +382,28 @@ class BoardTUI:
             return [terminal.pad_ansi(line1, width)]
 
         skey = self._state_key(ticket)
+        trains_cfg = self.ctx.board.release_trains if self.ctx else {}
+        binfo = ticket.build_info(
+            trains=trains_cfg,
+            label_prefix=self.ctx.board.release_label_prefix if self.ctx else "release:",
+            baseline_label=self.ctx.board.release_baseline_label if self.ctx else "release:baseline",
+        )
         badges: list[str] = []
+        if ticket.column == Column.DONE:
+            primary_builds = binfo.get("primary_builds") or {}
+            palette = (terminal.green, terminal.cyan, terminal.magenta, terminal.yellow)
+            for idx, (tid, ver) in enumerate(primary_builds.items()):
+                spec = trains_cfg.get(tid)
+                short_lbl = spec.effective_short_name() if spec else tid.upper()
+                color_fn = palette[idx % len(palette)]
+                badges.append(color_fn(f"{short_lbl}:{short_build_version(ver)}"))
+            if (
+                not primary_builds
+                and trains_cfg
+                and not binfo["is_baseline"]
+                and not binfo["is_release_ticket"]
+            ):
+                badges.append(terminal.yellow("Pending-Build"))
         if ticket.priority:
             badges.append(terminal.yellow(ticket.priority))
         if ticket.target_repo and ticket.target_repo != ticket.repo_alias:
@@ -455,6 +476,27 @@ class BoardTUI:
         lines = [sep, hdr]
 
         meta_parts: list[str] = []
+        trains_cfg = self.ctx.board.release_trains if self.ctx else {}
+        binfo = ticket.build_info(
+            trains=trains_cfg,
+            label_prefix=self.ctx.board.release_label_prefix if self.ctx else "release:",
+            baseline_label=self.ctx.board.release_baseline_label if self.ctx else "release:baseline",
+        )
+        primary_builds = binfo.get("primary_builds") or {}
+        palette = (terminal.green, terminal.cyan, terminal.magenta, terminal.yellow)
+        for idx, (tid, ver) in enumerate(primary_builds.items()):
+            spec = trains_cfg.get(tid)
+            short_lbl = spec.effective_short_name() if spec else tid.upper()
+            color_fn = palette[idx % len(palette)]
+            meta_parts.append(f"{short_lbl}: {color_fn(short_build_version(ver))}")
+        if (
+            ticket.column == Column.DONE
+            and not primary_builds
+            and trains_cfg
+            and not binfo["is_baseline"]
+            and not binfo["is_release_ticket"]
+        ):
+            meta_parts.append(f"Build: {terminal.yellow('Pending Next Build')}")
         if ticket.priority:
             meta_parts.append(f"Prio: {terminal.yellow(ticket.priority)}")
         if ticket.milestone:
