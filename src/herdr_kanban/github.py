@@ -16,6 +16,7 @@ from .model import (
     DepositMeta,
     Ticket,
     decode_meta,
+    extract_ticket_builds,
     is_lease_expired,
     match_column,
     populate_dependency_waves,
@@ -58,6 +59,8 @@ class ProjectSchema:
     options_by_name: dict[str, str] = field(default_factory=dict)  # exact option name -> optionId
     priority_field_id: str = ""
     priority_options_by_name: dict[str, str] = field(default_factory=dict)
+    cura_build_field_id: str = ""
+    firmware_build_field_id: str = ""
 
     def option_id_for_column(self, col: Column, column_map: dict[str, str]) -> str | None:
         preferred = column_map.get(col.value, "")
@@ -155,6 +158,18 @@ fragment ProjectFields on ProjectV2 {
       }
     }
   }
+  fields(first: 40) {
+    nodes {
+      ... on ProjectV2Field {
+        id
+        name
+      }
+      ... on ProjectV2SingleSelectField {
+        id
+        name
+      }
+    }
+  }
   items(first: 100, after: $cursor) {
     pageInfo {
       hasNextPage
@@ -172,6 +187,26 @@ fragment ProjectFields on ProjectV2 {
         ... on ProjectV2ItemFieldSingleSelectValue {
           name
           optionId
+        }
+      }
+      fieldValues(first: 20) {
+        nodes {
+          ... on ProjectV2ItemFieldTextValue {
+            text
+            field {
+              ... on ProjectV2FieldCommon {
+                name
+              }
+            }
+          }
+          ... on ProjectV2ItemFieldSingleSelectValue {
+            name
+            field {
+              ... on ProjectV2FieldCommon {
+                name
+              }
+            }
+          }
         }
       }
       content {
@@ -408,6 +443,17 @@ class GitHubClient:
                     for opt in (prio_field.get("options") or [])
                     if isinstance(opt, dict) and opt.get("name") and opt.get("id")
                 }
+                cura_field_id = ""
+                fw_field_id = ""
+                for fnode in ((proj.get("fields") or {}).get("nodes") or []):
+                    if not isinstance(fnode, dict):
+                        continue
+                    fname = str(fnode.get("name") or "").strip().lower()
+                    fid = str(fnode.get("id") or "").strip()
+                    if fname == "cura build" and fid:
+                        cura_field_id = fid
+                    elif fname == "firmware build" and fid:
+                        fw_field_id = fid
                 schema = ProjectSchema(
                     project_id=str(proj["id"]),
                     number=int(proj["number"]),
@@ -417,6 +463,8 @@ class GitHubClient:
                     options_by_name=options,
                     priority_field_id=str(prio_field.get("id") or ""),
                     priority_options_by_name=prio_options,
+                    cura_build_field_id=cura_field_id,
+                    firmware_build_field_id=fw_field_id,
                 )
 
             items_conn = proj.get("items") or {}
@@ -461,6 +509,21 @@ class GitHubClient:
                 prio_val = node.get("priorityValue") or {}
                 priority_name = str(prio_val.get("name") or "")
 
+                raw_cura_build = ""
+                raw_fw_build = ""
+                for fv in ((node.get("fieldValues") or {}).get("nodes") or []):
+                    if not isinstance(fv, dict):
+                        continue
+                    f_info = fv.get("field") or {}
+                    f_name = str(f_info.get("name") or "").strip().lower()
+                    val_str = str(fv.get("text") or fv.get("name") or "").strip()
+                    if not val_str:
+                        continue
+                    if f_name == "cura build":
+                        raw_cura_build = val_str
+                    elif f_name == "firmware build":
+                        raw_fw_build = val_str
+
                 milestone_node = issue.get("milestone") or {}
                 milestone_title = (
                     str(milestone_node.get("title") or "") if isinstance(milestone_node, dict) else ""
@@ -501,10 +564,18 @@ class GitHubClient:
                     for a in ((issue.get("assignees") or {}).get("nodes") or [])
                     if isinstance(a, dict) and a.get("login")
                 ]
+                title_text = str(issue.get("title") or "")
+                binfo = extract_ticket_builds(
+                    labels,
+                    body_text,
+                    title_text,
+                    cura_field=raw_cura_build,
+                    firmware_field=raw_fw_build,
+                )
                 tickets.append(
                     Ticket(
                         number=int(issue["number"]),
-                        title=str(issue.get("title") or ""),
+                        title=title_text,
                         body=body_text,
                         state=str(issue.get("state") or "OPEN"),
                         url=str(issue.get("url") or ""),
@@ -514,6 +585,8 @@ class GitHubClient:
                         priority=priority_name,
                         milestone=milestone_title,
                         target_repo=target_repo,
+                        cura_build=binfo["cura_build"],
+                        firmware_build=binfo["firmware_build"],
                         column=col,
                         status_name=status_name,
                         project_item_id=str(node["id"]),
@@ -582,6 +655,74 @@ class GitHubClient:
                 "itemId": project_item_id,
                 "fieldId": schema.priority_field_id,
                 "optionId": option_id,
+            },
+        )
+        return True
+
+    def ensure_text_field(
+        self,
+        project_id: str,
+        field_name: str,
+        existing_field_id: str = "",
+    ) -> str:
+        """Ensure a ProjectV2 TEXT field exists and return its `fieldId`."""
+        if existing_field_id:
+            return existing_field_id
+        if not project_id or not field_name.strip():
+            return ""
+        mutation = """
+        mutation($projectId: ID!, $name: String!) {
+          createProjectV2Field(
+            input: {
+              projectId: $projectId
+              dataType: TEXT
+              name: $name
+            }
+          ) {
+            projectV2Field {
+              ... on ProjectV2Field {
+                id
+                name
+              }
+            }
+          }
+        }
+        """
+        data = self.graphql(mutation, {"projectId": project_id, "name": field_name.strip()})
+        fld = ((data.get("createProjectV2Field") or {}).get("projectV2Field")) or {}
+        return str(fld.get("id") or "")
+
+    def set_item_text_field(
+        self,
+        project_id: str,
+        item_id: str,
+        field_id: str,
+        text: str,
+    ) -> bool:
+        """Set a ProjectV2 TEXT field value on an item."""
+        if not project_id or not item_id or not field_id:
+            return False
+        mutation = """
+        mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $text: String!) {
+          updateProjectV2ItemFieldValue(
+            input: {
+              projectId: $projectId
+              itemId: $itemId
+              fieldId: $fieldId
+              value: { text: $text }
+            }
+          ) {
+            projectV2Item { id }
+          }
+        }
+        """
+        self.graphql(
+            mutation,
+            {
+                "projectId": project_id,
+                "itemId": item_id,
+                "fieldId": field_id,
+                "text": text,
             },
         )
         return True

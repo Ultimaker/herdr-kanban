@@ -31,7 +31,7 @@ const ACTIVE_COL_MIN_WIDTH = 276;
 const ACTIVE_COL_MAX_WIDTH = 360;
 const EMPTY_COL_COMPACT_WIDTH = 104;
 const UNIFORM_COL_WIDTH = 248;
-const CARD_EST_HEIGHT = 116;
+const CARD_EST_HEIGHT = 124;
 const DEFAULT_PRIORITIES = ["P0", "P1", "P2", "P3"];
 const DEFAULT_AGENTS = ["agy", "claude", "codex", "opencode", "gemini", "copilot"];
 
@@ -326,6 +326,120 @@ function parseFacetLabel(rawLabel, t) {
   return { prefix, text: str, color: t.muted, bg: t.background };
 }
 
+function shortBuildVersion(rawVer) {
+  const s = String(rawVer || "").trim();
+  if (!s) return "";
+  return s.replace(/\+[A-Za-z0-9._-]+$/, "");
+}
+
+function compactAlphaLabel(rawVer) {
+  const s = shortBuildVersion(rawVer);
+  if (!s) return "";
+  if (s === "unreleased") return "Unreleased";
+  const m = /^(\d+\.\d+\.\d+)-alpha\.(\d+)$/i.exec(s);
+  if (m) return `${m[1]}-α${m[2]}`;
+  return s;
+}
+
+function resolveTicketBuilds(ticket) {
+  if (!ticket) {
+    return {
+      curaBuild: "",
+      firmwareBuild: "",
+      curaBuilds: [],
+      firmwareBuilds: [],
+      isBaseline: false,
+      isReleaseTicket: false,
+      unreleasedTrains: [],
+    };
+  }
+  const curaSet = new Set(Array.isArray(ticket.cura_builds) ? ticket.cura_builds : []);
+  const fwSet = new Set(Array.isArray(ticket.firmware_builds) ? ticket.firmware_builds : []);
+  if (ticket.cura_build) curaSet.add(String(ticket.cura_build).trim());
+  if (ticket.firmware_build) fwSet.add(String(ticket.firmware_build).trim());
+
+  let isBaseline = Boolean(ticket.is_baseline);
+  const titleStr = String(ticket.title || "");
+  const bodyStr = String(ticket.body || "");
+  let isReleaseTicket =
+    Boolean(ticket.is_release_ticket) ||
+    titleStr.toLowerCase().includes("[release]") ||
+    bodyStr.toLowerCase().includes("release-ticket:true");
+
+  const rawLabels = Array.isArray(ticket.labels) ? ticket.labels : [];
+  for (const raw of rawLabels) {
+    const lbl = String(raw || "").trim();
+    const low = lbl.toLowerCase();
+    if (low === "release:baseline") {
+      isBaseline = true;
+    } else if (low.startsWith("release:cura-") || low.startsWith("release:slicer-")) {
+      const v = lbl.slice(lbl.indexOf("-") + 1).trim();
+      if (v) curaSet.add(v);
+    } else if (low.startsWith("release:ultimoco-") || low.startsWith("release:firmware-")) {
+      const v = lbl.slice(lbl.indexOf("-") + 1).trim();
+      if (v) fwSet.add(v);
+    }
+  }
+
+  const relInRe = /Released-In:.*?\(\s*(slicer|cura|firmware|ultimoco)\s*:\s*`?([0-9]+\.[0-9]+\.[0-9]+[^\s`)]*)`?\s*\)/gi;
+  let m;
+  while ((m = relInRe.exec(bodyStr)) !== null) {
+    const tr = m[1].toLowerCase();
+    const ver = m[2].trim();
+    if (tr === "slicer" || tr === "cura") curaSet.add(ver);
+    else if (tr === "firmware" || tr === "ultimoco") fwSet.add(ver);
+  }
+
+  if (isReleaseTicket && curaSet.size === 0 && fwSet.size === 0) {
+    const vm = /(\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?(?:\+[A-Za-z0-9.]+)?)/.exec(titleStr);
+    if (vm) {
+      const tLow = titleStr.toLowerCase();
+      if (tLow.includes("cura") || tLow.includes("slicer")) curaSet.add(vm[1]);
+      else if (tLow.includes("ultimoco") || tLow.includes("firmware") || tLow.includes("emb-476")) {
+        fwSet.add(vm[1]);
+      }
+    }
+  }
+
+  const curaBuilds = Array.from(curaSet).filter(Boolean);
+  const firmwareBuilds = Array.from(fwSet).filter(Boolean);
+  let unreleasedTrains = Array.isArray(ticket.unreleased_trains)
+    ? [...ticket.unreleased_trains]
+    : [];
+  if (
+    ticket.column === "done" &&
+    curaBuilds.length === 0 &&
+    firmwareBuilds.length === 0 &&
+    !isBaseline &&
+    !isReleaseTicket &&
+    unreleasedTrains.length === 0
+  ) {
+    const lowLabels = rawLabels.map((x) => String(x).toLowerCase());
+    if (lowLabels.includes("domain:slicing") || lowLabels.includes("domain:wire-contract")) {
+      unreleasedTrains.push("cura");
+    }
+    if (
+      lowLabels.includes("domain:rt-control") ||
+      lowLabels.includes("domain:som") ||
+      lowLabels.includes("domain:digital-twin") ||
+      lowLabels.includes("domain:wire-contract")
+    ) {
+      unreleasedTrains.push("firmware");
+    }
+    if (unreleasedTrains.length === 0) unreleasedTrains.push("cura");
+  }
+
+  return {
+    curaBuild: curaBuilds[0] || "",
+    firmwareBuild: firmwareBuilds[0] || "",
+    curaBuilds,
+    firmwareBuilds,
+    isBaseline,
+    isReleaseTicket,
+    unreleasedTrains,
+  };
+}
+
 function stripKanbanMeta(rawBody) {
   if (!rawBody) return "";
   let text = String(rawBody).replace(/<!--\s*herdr-kanban:v1\s+\{[\s\S]*?\}\s*-->/g, "").trim();
@@ -605,7 +719,13 @@ export default class KanbanBoard extends View {
       repoFilter: "",
       quickFilter: "active", // "active" | "all" | "p0"
       compactEmpty: true,
-      viewMode: "board", // "board" | "whats_new"
+      viewMode: "board", // "board" | "changelog" | "whats_new"
+      changelogTrain: "all", // "all" | "firmware" | "cura"
+      changelogType: "all", // "all" | "bug" | "feature" | "forensics"
+      changelogFwFrom: "",
+      changelogFwTo: "",
+      changelogCuraFrom: "",
+      changelogCuraTo: "",
       agentKind: "agy",
       overrideSpaceId: null,
       showDrawer: true,
@@ -618,7 +738,11 @@ export default class KanbanBoard extends View {
       bus.quickFilter = "active";
       bus.quickFilterMigratedV044 = true;
     }
-    if (props()?.view === "board" || props()?.view === "whats_new") {
+    if (
+      props()?.view === "board" ||
+      props()?.view === "changelog" ||
+      props()?.view === "whats_new"
+    ) {
       bus.viewMode = props().view;
     }
     bus.resolvedCwdBySpace ??= {};
@@ -644,6 +768,12 @@ export default class KanbanBoard extends View {
     this.quickFilter = bus.quickFilter || "active";
     this.compactEmpty = bus.compactEmpty !== false;
     this.viewMode = bus.viewMode || "board";
+    this.changelogTrain = bus.changelogTrain || "all";
+    this.changelogType = bus.changelogType || "all";
+    this.changelogFwFrom = bus.changelogFwFrom || "";
+    this.changelogFwTo = bus.changelogFwTo || "";
+    this.changelogCuraFrom = bus.changelogCuraFrom || "";
+    this.changelogCuraTo = bus.changelogCuraTo || "";
     this.agentKind = bus.agentKind;
     this.userPickedAgent = false;
 
@@ -734,6 +864,8 @@ export default class KanbanBoard extends View {
           } else if (cmd === "whats_new" || cmd?.action === "whats_new") {
             this.syncBus({ viewMode: "whats_new" }, cx);
             this.refresh(cx, true);
+          } else if (cmd === "changelog" || cmd?.action === "changelog") {
+            this.syncBus({ viewMode: "changelog" }, cx);
           } else if (cmd === "board" || cmd?.action === "board") {
             this.syncBus({ viewMode: "board" }, cx);
           } else if (cmd === "summarize" || cmd?.action === "summarize") {
@@ -751,7 +883,11 @@ export default class KanbanBoard extends View {
     const seq = Number(nav.seq || 0);
     if (!seq || seq <= this.lastNavSeq) return false;
     this.lastNavSeq = seq;
-    if (nav.viewMode === "board" || nav.viewMode === "whats_new") {
+    if (
+      nav.viewMode === "board" ||
+      nav.viewMode === "changelog" ||
+      nav.viewMode === "whats_new"
+    ) {
       this.syncBus({ viewMode: nav.viewMode }, cx);
     }
     if (nav.selectedRef) {
@@ -788,6 +924,12 @@ export default class KanbanBoard extends View {
       if (patch.viewMode !== undefined) {
         v.viewMode = patch.viewMode;
       }
+      if (patch.changelogTrain !== undefined) v.changelogTrain = patch.changelogTrain;
+      if (patch.changelogType !== undefined) v.changelogType = patch.changelogType;
+      if (patch.changelogFwFrom !== undefined) v.changelogFwFrom = patch.changelogFwFrom;
+      if (patch.changelogFwTo !== undefined) v.changelogFwTo = patch.changelogFwTo;
+      if (patch.changelogCuraFrom !== undefined) v.changelogCuraFrom = patch.changelogCuraFrom;
+      if (patch.changelogCuraTo !== undefined) v.changelogCuraTo = patch.changelogCuraTo;
       if (patch.agentKind !== undefined) {
         v.agentKind = patch.agentKind;
         v.userPickedAgent = true;
@@ -954,12 +1096,15 @@ export default class KanbanBoard extends View {
       const prio = String(t.priority || "").toLowerCase();
       const owner = t.claim && t.claim.owner ? `@${t.claim.owner.toLowerCase()}` : "";
       const labels = Array.isArray(t.labels) ? t.labels.join(" ").toLowerCase() : "";
+      const binfo = resolveTicketBuilds(t);
+      const buildsStr = `${binfo.curaBuild} ${binfo.firmwareBuild}`.toLowerCase();
       return (
         ref.includes(q) ||
         title.includes(q) ||
         prio.includes(q) ||
         owner.includes(q) ||
-        labels.includes(q)
+        labels.includes(q) ||
+        buildsStr.includes(q)
       );
     });
   }
@@ -1604,6 +1749,10 @@ export default class KanbanBoard extends View {
       const nextView = this.viewMode === "whats_new" ? "board" : "whats_new";
       this.syncBus({ viewMode: nextView }, cx);
       cx.stop_propagation();
+    } else if (key === "g") {
+      const nextView = this.viewMode === "changelog" ? "board" : "changelog";
+      this.syncBus({ viewMode: nextView }, cx);
+      cx.stop_propagation();
     } else if (key === "b") {
       this.syncBus({ viewMode: "board" }, cx);
       cx.stop_propagation();
@@ -1699,7 +1848,7 @@ export default class KanbanBoard extends View {
       else closeOverlay(props()?.overlay || "herdr-kanban");
       cx.stop_propagation();
     } else if (key === "escape") {
-      if (this.viewMode === "whats_new") {
+      if (this.viewMode === "whats_new" || this.viewMode === "changelog") {
         this.syncBus({ viewMode: "board" }, cx);
       } else if (this.showDrawer) {
         this.syncBus({ showDrawer: false }, cx);
@@ -1861,6 +2010,46 @@ export default class KanbanBoard extends View {
                             : `${allTickets.length}`
                         )
                     )
+                  )
+              )
+              .child(
+                h_flex()
+                  .id("view-tab-changelog")
+                  .items_center()
+                  .gap(5)
+                  .px(8)
+                  .py(3)
+                  .rounded(5)
+                  .cursor_pointer()
+                  .bg(this.viewMode === "changelog" ? t.selected : t.background)
+                  .text_size(11.5)
+                  .font_medium()
+                  .text_color(this.viewMode === "changelog" ? t.foreground : t.muted)
+                  .hover((s) => s.bg(this.viewMode === "changelog" ? t.selected : t.hover))
+                  .on_click((_ev, cx) => this.syncBus({ viewMode: "changelog" }, cx))
+                  .child(
+                    svg("mods/workspace-chrome/git-branch.svg")
+                      .size(11)
+                      .text_color(this.viewMode === "changelog" ? t.accent : t.muted)
+                  )
+                  .child("Changelog")
+                  .when(
+                    Boolean(
+                      this.board &&
+                        this.board.changelog &&
+                        Array.isArray(this.board.changelog.builds) &&
+                        this.board.changelog.builds.length > 0
+                    ),
+                    (el) =>
+                      el.child(
+                        div()
+                          .px(4)
+                          .rounded(3)
+                          .bg(withAlpha(t.accent, "20") || t.surface)
+                          .text_size(10)
+                          .text_color(t.accent)
+                          .child(String(this.board.changelog.builds.length))
+                      )
                   )
               )
               .child(
@@ -2420,8 +2609,14 @@ export default class KanbanBoard extends View {
     const unmetDeps = Array.isArray(ticket.unmet_deps) ? ticket.unmet_deps : [];
     const blocks = Array.isArray(ticket.blocks) ? ticket.blocks : [];
     const rawLabels = Array.isArray(ticket.labels) ? ticket.labels : [];
+    const buildInfo = resolveTicketBuilds(ticket);
     const visibleFacets = rawLabels
-      .filter((l) => !l.startsWith("trl:") && !l.startsWith("access:"))
+      .filter(
+        (l) =>
+          !l.startsWith("trl:") &&
+          !l.startsWith("access:") &&
+          !l.startsWith("release:")
+      )
       .slice(0, 2)
       .map((l) => parseFacetLabel(l, t));
     const checkDone = ticket.checklist_done || 0;
@@ -2772,6 +2967,126 @@ export default class KanbanBoard extends View {
           .font_medium()
           .text_color(isDepBlocked && !isSelected ? t.muted : t.foreground)
           .child(cleanTitle)
+      )
+      .when(
+        Boolean(
+          isDoneCol ||
+            buildInfo.curaBuild ||
+            buildInfo.firmwareBuild ||
+            buildInfo.unreleasedTrains.length > 0
+        ),
+        (d) => {
+          const curaCol = t.done || t.ansi2 || "#10b981";
+          const fwCol = t.accent || "#4c8bf5";
+          const warnCol = t.working || t.ansi3 || "#d97736";
+          const buildPills = [];
+          if (buildInfo.curaBuild) {
+            const shortCura = shortBuildVersion(buildInfo.curaBuild);
+            buildPills.push(
+              h_flex()
+                .id(`card-cura-bld-${ticket.number}`)
+                .flex_none()
+                .items_center()
+                .gap(3)
+                .px(5)
+                .py(1.5)
+                .rounded(4)
+                .bg(withAlpha(curaCol, "1A") || t.background)
+                .border_1()
+                .border_color(withAlpha(curaCol, "66") || curaCol)
+                .child(div().size(5).rounded_full().bg(curaCol))
+                .child(
+                  div()
+                    .text_size(9.5)
+                    .font_semibold()
+                    .text_color(curaCol)
+                    .child(`Cura ${shortCura}`)
+                )
+            );
+          }
+          if (buildInfo.firmwareBuild) {
+            const shortFw = shortBuildVersion(buildInfo.firmwareBuild);
+            buildPills.push(
+              h_flex()
+                .id(`card-fw-bld-${ticket.number}`)
+                .flex_none()
+                .items_center()
+                .gap(3)
+                .px(5)
+                .py(1.5)
+                .rounded(4)
+                .bg(withAlpha(fwCol, "1A") || t.background)
+                .border_1()
+                .border_color(withAlpha(fwCol, "66") || fwCol)
+                .child(div().size(5).rounded_full().bg(fwCol))
+                .child(
+                  div()
+                    .text_size(9.5)
+                    .font_semibold()
+                    .text_color(fwCol)
+                    .child(`FW ${shortFw}`)
+                )
+            );
+          }
+          if (
+            buildPills.length === 0 &&
+            isDoneCol &&
+            !buildInfo.isBaseline &&
+            !buildInfo.isReleaseTicket
+          ) {
+            const trLabel =
+              buildInfo.unreleasedTrains.length > 0
+                ? buildInfo.unreleasedTrains
+                    .map((tr) => (tr === "firmware" ? "FW" : "Cura"))
+                    .join("+")
+                : "Next";
+            buildPills.push(
+              h_flex()
+                .id(`card-unrel-bld-${ticket.number}`)
+                .flex_none()
+                .items_center()
+                .gap(3)
+                .px(5)
+                .py(1.5)
+                .rounded(4)
+                .bg(withAlpha(warnCol, "1A") || t.background)
+                .border_1()
+                .border_color(withAlpha(warnCol, "66") || warnCol)
+                .child(div().size(5).rounded_full().bg(warnCol))
+                .child(
+                  div()
+                    .text_size(9.5)
+                    .font_semibold()
+                    .text_color(warnCol)
+                    .child(`Pending ${trLabel} Build`)
+                )
+            );
+          } else if (buildPills.length === 0 && buildInfo.isBaseline) {
+            buildPills.push(
+              div()
+                .id(`card-base-bld-${ticket.number}`)
+                .flex_none()
+                .px(5)
+                .py(1)
+                .rounded(4)
+                .bg(t.background)
+                .border_1()
+                .border_color(t.border)
+                .text_size(9.5)
+                .text_color(t.dim)
+                .child("Baseline")
+            );
+          }
+          if (buildPills.length === 0) return d;
+          return d.child(
+            h_flex()
+              .w_full()
+              .items_center()
+              .gap(5)
+              .overflow_hidden()
+              .children(buildPills)
+          );
+        }
       )
       .when(cardFacetItems.length > 0, (d) =>
         d.child(
@@ -3615,6 +3930,41 @@ export default class KanbanBoard extends View {
                             .text_color(t.foreground)
                             .child(item.clean_title || item.title)
                         )
+                        .when(
+                          Boolean(Array.isArray(item.releases) && item.releases.length > 0),
+                          (relRow) =>
+                            relRow.child(
+                              h_flex()
+                                .w_full()
+                                .items_center()
+                                .gap(5)
+                                .overflow_hidden()
+                                .children(
+                                  item.releases.slice(0, 3).map((relStr, rIdx) => {
+                                    const isFw = String(relStr).toLowerCase().startsWith("ultimoco");
+                                    const col = isFw ? t.accent : t.done || t.ansi2;
+                                    const cleanRel = shortBuildVersion(
+                                      String(relStr)
+                                        .replace(/^cura-/i, "Cura ")
+                                        .replace(/^ultimoco-/i, "FW ")
+                                    );
+                                    return div()
+                                      .id(`wn-rel-${idx}-${rIdx}`)
+                                      .flex_none()
+                                      .px(5)
+                                      .py(1)
+                                      .rounded(4)
+                                      .bg(withAlpha(col, "18") || t.background)
+                                      .border_1()
+                                      .border_color(withAlpha(col, "60") || col)
+                                      .text_size(9.5)
+                                      .font_semibold()
+                                      .text_color(col)
+                                      .child(cleanRel);
+                                  })
+                                )
+                            )
+                        )
                         .when(Boolean(item.summary_note), (sn) =>
                           sn.child(
                             div()
@@ -3631,6 +3981,720 @@ export default class KanbanBoard extends View {
                     )
                   )
               )
+          )
+      );
+  }
+
+  jumpToBuildChangelog(train, version, cx) {
+    if (!version) return;
+    if (train === "firmware") {
+      this.syncBus(
+        {
+          viewMode: "changelog",
+          changelogTrain: "firmware",
+          changelogFwFrom: version,
+          changelogFwTo: version,
+        },
+        cx
+      );
+    } else if (train === "cura") {
+      this.syncBus(
+        {
+          viewMode: "changelog",
+          changelogTrain: "cura",
+          changelogCuraFrom: version,
+          changelogCuraTo: version,
+        },
+        cx
+      );
+    }
+  }
+
+  toggleVersionRangeChip(train, version, versionList, cx) {
+    const fromKey = train === "firmware" ? "changelogFwFrom" : "changelogCuraFrom";
+    const toKey = train === "firmware" ? "changelogFwTo" : "changelogCuraTo";
+    const curFrom = this[fromKey] || "";
+    const curTo = this[toKey] || "";
+
+    if (!curFrom && !curTo) {
+      this.syncBus({ [fromKey]: version, [toKey]: version }, cx);
+      return;
+    }
+    if (curFrom === version && curTo === version) {
+      this.syncBus({ [fromKey]: "", [toKey]: "" }, cx);
+      return;
+    }
+    const idxClick = versionList.indexOf(version);
+    const idxFrom = curFrom ? versionList.indexOf(curFrom) : 0;
+    const idxTo = curTo ? versionList.indexOf(curTo) : versionList.length - 1;
+    if (idxClick < 0) return;
+
+    if (curFrom === curTo) {
+      const lo = Math.min(idxFrom, idxClick);
+      const hi = Math.max(idxFrom, idxClick);
+      this.syncBus({ [fromKey]: versionList[lo], [toKey]: versionList[hi] }, cx);
+    } else {
+      this.syncBus({ [fromKey]: version, [toKey]: version }, cx);
+    }
+  }
+
+  renderChangelogView(t) {
+    const cl = (this.board && this.board.changelog) || {};
+    const fwVersions = Array.isArray(cl.firmware_versions) ? cl.firmware_versions : [];
+    const curaVersions = Array.isArray(cl.cura_versions) ? cl.cura_versions : [];
+    const allBuilds = Array.isArray(cl.builds) ? cl.builds : [];
+    const trainFilter = this.changelogTrain || "all";
+    const typeFilter = this.changelogType || "all";
+    const q = (this.searchQuery || "").toLowerCase();
+    const repoFlt = (this.repoFilter || "").toLowerCase();
+
+    const curaCol = t.done || t.ansi2 || "#10b981";
+    const fwCol = t.accent || "#4c8bf5";
+    const warnCol = t.working || t.ansi3 || "#d97736";
+
+    const inRange = (ver, verList, rawFrom, rawTo) => {
+      if (!verList.length) return true;
+      const idx = verList.indexOf(ver);
+      if (idx < 0) return true;
+      const lo = rawFrom && verList.indexOf(rawFrom) >= 0 ? verList.indexOf(rawFrom) : 0;
+      const hi =
+        rawTo && verList.indexOf(rawTo) >= 0 ? verList.indexOf(rawTo) : verList.length - 1;
+      const minIdx = Math.min(lo, hi);
+      const maxIdx = Math.max(lo, hi);
+      return idx >= minIdx && idx <= maxIdx;
+    };
+
+    const filteredBuilds = [];
+    const uniqueTicketsMap = new Map();
+    for (const bld of allBuilds) {
+      if (trainFilter !== "all" && bld.train !== trainFilter) continue;
+      if (
+        bld.train === "firmware" &&
+        !inRange(bld.version, fwVersions, this.changelogFwFrom, this.changelogFwTo)
+      ) {
+        continue;
+      }
+      if (
+        bld.train === "cura" &&
+        !inRange(bld.version, curaVersions, this.changelogCuraFrom, this.changelogCuraTo)
+      ) {
+        continue;
+      }
+      const rawItems = Array.isArray(bld.tickets) ? bld.tickets : [];
+      const matchedItems = rawItems.filter((it) => {
+        if (repoFlt && String(it.target_repo || "").toLowerCase() !== repoFlt) return false;
+        if (typeFilter !== "all" && String(it.type || "").toLowerCase() !== typeFilter) {
+          return false;
+        }
+        if (!q) return true;
+        const hay = `${it.ref} #${it.number} ${it.title} ${it.target_repo} ${
+          it.cura_build || ""
+        } ${it.firmware_build || ""} ${(it.labels || []).join(" ")} @${
+          it.owner || ""
+        }`.toLowerCase();
+        return hay.includes(q);
+      });
+      if ((q || repoFlt || typeFilter !== "all") && matchedItems.length === 0) {
+        continue;
+      }
+      for (const it of matchedItems) {
+        uniqueTicketsMap.set(it.number, it);
+      }
+      filteredBuilds.push({
+        ...bld,
+        matchedItems,
+      });
+    }
+
+    const uniqueTickets = Array.from(uniqueTicketsMap.values());
+    const totalBugs = uniqueTickets.filter((x) => x.type === "bug").length;
+    const totalFeatures = uniqueTickets.filter((x) => x.type === "feature").length;
+    const totalForensics = uniqueTickets.filter((x) => x.type === "forensics").length;
+    const hasCustomRange = Boolean(
+      this.changelogFwFrom ||
+        this.changelogFwTo ||
+        this.changelogCuraFrom ||
+        this.changelogCuraTo ||
+        trainFilter !== "all" ||
+        typeFilter !== "all"
+    );
+
+    const renderVersionSelectorRow = (trainKey, label, versions, rawFrom, rawTo, accentCol) => {
+      if (!versions.length) return null;
+      const loIdx = rawFrom && versions.indexOf(rawFrom) >= 0 ? versions.indexOf(rawFrom) : 0;
+      const hiIdx =
+        rawTo && versions.indexOf(rawTo) >= 0 ? versions.indexOf(rawTo) : versions.length - 1;
+      const minIdx = Math.min(loIdx, hiIdx);
+      const maxIdx = Math.max(loIdx, hiIdx);
+      const isFiltered = Boolean(rawFrom || rawTo);
+      const rangeText = isFiltered
+        ? minIdx === maxIdx
+          ? shortBuildVersion(versions[minIdx])
+          : `${shortBuildVersion(versions[minIdx])} → ${shortBuildVersion(versions[maxIdx])}`
+        : `All (${versions.length})`;
+
+      return h_flex()
+        .id(`cl-range-row-${trainKey}`)
+        .w_full()
+        .flex_none()
+        .items_center()
+        .gap(6)
+        .px(14)
+        .py(5)
+        .bg(t.surface)
+        .border_b(1)
+        .border_color(t.border)
+        .child(
+          h_flex()
+            .flex_none()
+            .w(158)
+            .items_center()
+            .justify_between()
+            .gap(4)
+            .child(
+              h_flex()
+                .items_center()
+                .gap(5)
+                .child(div().size(6).rounded_full().bg(accentCol))
+                .child(
+                  div()
+                    .text_size(11)
+                    .font_semibold()
+                    .text_color(t.foreground)
+                    .child(label)
+                )
+            )
+            .child(
+              div()
+                .px(5)
+                .py(1)
+                .rounded(4)
+                .bg(withAlpha(accentCol, "18") || t.background)
+                .text_size(9.5)
+                .font_semibold()
+                .text_color(accentCol)
+                .child(truncStr(rangeText, 19))
+            )
+        )
+        .child(
+          renderChunkedPillRows(
+            versions.map((ver, vIdx) => {
+              const inSel = vIdx >= minIdx && vIdx <= maxIdx;
+              const isEndpoint = isFiltered && (vIdx === minIdx || vIdx === maxIdx);
+              const chipLbl =
+                ver === "unreleased"
+                  ? "Unreleased"
+                  : shortBuildVersion(ver).replace(/^\d+\.\d+\.\d+-alpha\./, "α");
+              return {
+                chars: chipLbl.length + 1,
+                el: div()
+                  .id(`cl-ver-${trainKey}-${vIdx}`)
+                  .flex_none()
+                  .px(6)
+                  .py(1.5)
+                  .rounded(4)
+                  .cursor_pointer()
+                  .bg(
+                    isEndpoint
+                      ? withAlpha(accentCol, "32") || t.selected
+                      : inSel && isFiltered
+                      ? withAlpha(accentCol, "18") || t.selected
+                      : t.background
+                  )
+                  .border_1()
+                  .border_color(
+                    isEndpoint
+                      ? accentCol
+                      : inSel && isFiltered
+                      ? withAlpha(accentCol, "70") || accentCol
+                      : t.border
+                  )
+                  .text_size(10)
+                  .font_semibold()
+                  .text_color(inSel ? (isFiltered ? accentCol : t.foreground) : t.dim)
+                  .hover((s) => s.bg(t.hover))
+                  .on_click((_ev, cx) =>
+                    this.toggleVersionRangeChip(trainKey, ver, versions, cx)
+                  )
+                  .child(chipLbl),
+              };
+            }),
+            82,
+            4,
+            4
+          )
+        );
+    };
+
+    return v_flex()
+      .id("changelog-root")
+      .flex_1()
+      .min_h(0)
+      .w_full()
+      .bg(t.background)
+      .overflow_hidden()
+      .child(
+        // Top Controls Bar: Train Filter + Type Filter + Reset
+        h_flex()
+          .w_full()
+          .h(38)
+          .flex_none()
+          .items_center()
+          .justify_between()
+          .gap(8)
+          .px(14)
+          .bg(t.surface)
+          .border_b(1)
+          .border_color(t.border)
+          .child(
+            h_flex()
+              .items_center()
+              .gap(6)
+              .child(
+                div()
+                  .text_size(12)
+                  .font_semibold()
+                  .text_color(t.foreground)
+                  .child("Build Changelog & Fix Availability")
+              )
+              .child(
+                h_flex()
+                  .items_center()
+                  .gap(3)
+                  .p(2)
+                  .rounded(6)
+                  .bg(t.background)
+                  .border_1()
+                  .border_color(t.border)
+                  .children(
+                    [
+                      { id: "all", label: "All Trains" },
+                      { id: "firmware", label: `Firmware (${fwVersions.length})` },
+                      { id: "cura", label: `Cura (${curaVersions.length})` },
+                    ].map((tr) => {
+                      const active = trainFilter === tr.id;
+                      return div()
+                        .id(`cl-train-${tr.id}`)
+                        .px(7)
+                        .py(2)
+                        .rounded(4)
+                        .cursor_pointer()
+                        .bg(active ? t.selected : t.background)
+                        .text_size(10.5)
+                        .font_medium()
+                        .text_color(active ? t.accent : t.muted)
+                        .on_click((_ev, cx) =>
+                          this.syncBus({ changelogTrain: tr.id }, cx)
+                        )
+                        .child(tr.label);
+                    })
+                  )
+              )
+          )
+          .child(
+            h_flex()
+              .items_center()
+              .gap(5)
+              .child(
+                h_flex()
+                  .items_center()
+                  .gap(3)
+                  .p(2)
+                  .rounded(6)
+                  .bg(t.background)
+                  .border_1()
+                  .border_color(t.border)
+                  .children(
+                    [
+                      { id: "all", label: "All Types" },
+                      { id: "bug", label: `Bugs (${totalBugs})` },
+                      { id: "feature", label: `Features (${totalFeatures})` },
+                      { id: "forensics", label: `Forensics (${totalForensics})` },
+                    ].map((tp) => {
+                      const active = typeFilter === tp.id;
+                      return div()
+                        .id(`cl-type-${tp.id}`)
+                        .px(6)
+                        .py(2)
+                        .rounded(4)
+                        .cursor_pointer()
+                        .bg(active ? t.selected : t.background)
+                        .text_size(10)
+                        .font_medium()
+                        .text_color(active ? t.foreground : t.muted)
+                        .on_click((_ev, cx) =>
+                          this.syncBus({ changelogType: tp.id }, cx)
+                        )
+                        .child(tp.label);
+                    })
+                  )
+              )
+              .when(hasCustomRange, (el) =>
+                el.child(
+                  btn("cl-reset-range", "Reset Range", t, {
+                    small: true,
+                    onClick: (_ev, cx) =>
+                      this.syncBus(
+                        {
+                          changelogTrain: "all",
+                          changelogType: "all",
+                          changelogFwFrom: "",
+                          changelogFwTo: "",
+                          changelogCuraFrom: "",
+                          changelogCuraTo: "",
+                        },
+                        cx
+                      ),
+                  })
+                )
+              )
+          )
+      )
+      .when(
+        trainFilter === "all" || trainFilter === "firmware",
+        (el) =>
+          el.child(
+            renderVersionSelectorRow(
+              "firmware",
+              "Firmware (12.0.0)",
+              fwVersions,
+              this.changelogFwFrom,
+              this.changelogFwTo,
+              fwCol
+            )
+          )
+      )
+      .when(
+        trainFilter === "all" || trainFilter === "cura",
+        (el) =>
+          el.child(
+            renderVersionSelectorRow(
+              "cura",
+              "Cura (5.15.0)",
+              curaVersions,
+              this.changelogCuraFrom,
+              this.changelogCuraTo,
+              curaCol
+            )
+          )
+      )
+      .child(
+        // Scrollable Build-by-Build Feed
+        v_flex()
+          .id("changelog-scroll-body")
+          .flex_1()
+          .min_h(0)
+          .w_full()
+          .overflow_y_scrollbar()
+          .p(14)
+          .gap(12)
+          .child(
+            // Range & Search Summary Callout
+            h_flex()
+              .w_full()
+              .flex_none()
+              .items_center()
+              .justify_between()
+              .px(12)
+              .py(8)
+              .rounded(7)
+              .bg(t.surface)
+              .border_1()
+              .border_color(q ? t.accent : t.border)
+              .child(
+                h_flex()
+                  .items_center()
+                  .gap(8)
+                  .child(
+                    div()
+                      .text_size(11.5)
+                      .font_semibold()
+                      .text_color(t.foreground)
+                      .child(
+                        q
+                          ? `Fix Lookup "${this.searchQuery}": ${uniqueTickets.length} matching ticket(s) across ${filteredBuilds.length} build(s)`
+                          : `Showing ${uniqueTickets.length} unique ticket(s) across ${filteredBuilds.length} build(s)`
+                      )
+                  )
+                  .child(
+                    div()
+                      .text_size(10.5)
+                      .text_color(t.muted)
+                      .child(
+                        `(${totalBugs} bug fixes · ${totalFeatures} features · ${totalForensics} forensics — click two version chips above to compare any build range)`
+                      )
+                  )
+              )
+          )
+          .when(filteredBuilds.length === 0, (el) =>
+            el.child(
+              v_flex()
+                .w_full()
+                .py(28)
+                .items_center()
+                .justify_center()
+                .child(
+                  div()
+                    .text_size(12)
+                    .text_color(t.dim)
+                    .child("No builds or tickets match the current filter / version range.")
+                )
+            )
+          )
+          .children(
+            filteredBuilds.map((bld, bIdx) => {
+              const isFw = bld.train === "firmware";
+              const isUnrel = Boolean(bld.is_unreleased);
+              const bCol = isUnrel ? warnCol : isFw ? fwCol : curaCol;
+              const rt = bld.release_ticket || null;
+              const items = bld.matchedItems || [];
+
+              return v_flex()
+                .id(`cl-build-card-${bIdx}`)
+                .w_full()
+                .flex_none()
+                .rounded(8)
+                .bg(t.surface)
+                .border_1()
+                .border_color(withAlpha(bCol, "66") || t.border)
+                .overflow_hidden()
+                .child(
+                  // Build Section Header
+                  h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .gap(8)
+                    .px(12)
+                    .py(8)
+                    .bg(withAlpha(bCol, "14") || t.chrome)
+                    .border_b(1)
+                    .border_color(t.border)
+                    .child(
+                      h_flex()
+                        .items_center()
+                        .gap(8)
+                        .child(
+                          div()
+                            .px(6)
+                            .py(2)
+                            .rounded(4)
+                            .bg(withAlpha(bCol, "24") || t.background)
+                            .text_size(10.5)
+                            .font_semibold()
+                            .text_color(bCol)
+                            .child(isFw ? "FIRMWARE BUILD" : "CURA BUILD")
+                        )
+                        .child(
+                          div()
+                            .text_size(12.5)
+                            .font_semibold()
+                            .text_color(t.foreground)
+                            .child(
+                              isUnrel
+                                ? `${bld.train_display} — Unreleased (Merged on Branch, Pending Next Build)`
+                                : `${bld.train_display} ${bld.version}`
+                            )
+                        )
+                        .when(Boolean(!isUnrel && bld.previous_short_version), (pv) =>
+                          pv.child(
+                            div()
+                              .text_size(10.5)
+                              .text_color(t.muted)
+                              .child(`(since ${bld.previous_short_version})`)
+                          )
+                        )
+                    )
+                    .child(
+                      h_flex()
+                        .items_center()
+                        .gap(6)
+                        .when(Boolean(rt && rt.companion_version), (cp) =>
+                          cp.child(
+                            div()
+                              .px(6)
+                              .py(1.5)
+                              .rounded(4)
+                              .bg(t.background)
+                              .border_1()
+                              .border_color(t.border)
+                              .text_size(10)
+                              .text_color(isFw ? curaCol : fwCol)
+                              .child(
+                                `Companion: ${shortBuildVersion(rt.companion_version)}`
+                              )
+                          )
+                        )
+                        .when(Boolean(rt && rt.ref), (r) =>
+                          r.child(
+                            div()
+                              .id(`cl-rt-link-${bIdx}`)
+                              .px(6)
+                              .py(1.5)
+                              .rounded(4)
+                              .cursor_pointer()
+                              .bg(t.background)
+                              .border_1()
+                              .border_color(t.border)
+                              .text_size(10)
+                              .text_color(t.accent)
+                              .hover((s) => s.bg(t.hover))
+                              .on_click((_ev, cx) =>
+                                this.selectTicketByRef(rt.cli_ref || rt.ref, cx)
+                              )
+                              .child(`Release ${rt.ref}`)
+                          )
+                        )
+                        .child(
+                          div()
+                            .px(6)
+                            .py(1.5)
+                            .rounded(4)
+                            .bg(t.background)
+                            .text_size(10)
+                            .font_semibold()
+                            .text_color(t.muted)
+                            .child(`${items.length} ticket(s)`)
+                        )
+                    )
+                )
+                .child(
+                  // Tickets inside this Build
+                  v_flex()
+                    .w_full()
+                    .p(10)
+                    .gap(6)
+                    .when(items.length === 0, (emptyEl) =>
+                      emptyEl.child(
+                        div()
+                          .text_size(11)
+                          .text_color(t.dim)
+                          .child("Version bump / rebuild with 0 newly collected tickets.")
+                      )
+                    )
+                    .children(
+                      items.map((it, tIdx) => {
+                        const isBug = it.type === "bug" || it.type === "forensics";
+                        const typeCol = isBug
+                          ? t.blocked || t.ansi1
+                          : t.working || t.ansi3;
+                        return h_flex()
+                          .id(`cl-item-${bIdx}-${tIdx}`)
+                          .w_full()
+                          .items_center()
+                          .justify_between()
+                          .gap(8)
+                          .px(9)
+                          .py(6)
+                          .rounded(6)
+                          .cursor_pointer()
+                          .bg(t.background)
+                          .border_1()
+                          .border_color(t.border)
+                          .hover((s) => s.bg(t.hover))
+                          .on_click((_ev, cx) => this.selectTicketByRef(it.cli_ref, cx))
+                          .child(
+                            h_flex()
+                              .items_center()
+                              .gap(6)
+                              .min_w(0)
+                              .flex_1()
+                              .child(
+                                div()
+                                  .flex_none()
+                                  .text_size(11)
+                                  .font_semibold()
+                                  .text_color(t.accent)
+                                  .child(it.ref)
+                              )
+                              .when(Boolean(it.priority), (p) =>
+                                p.child(
+                                  div()
+                                    .flex_none()
+                                    .px(4)
+                                    .py(0.5)
+                                    .rounded(3)
+                                    .bg(t.surface)
+                                    .text_size(9.5)
+                                    .font_semibold()
+                                    .text_color(priorityColor(it.priority, t))
+                                    .child(it.priority)
+                                )
+                              )
+                              .child(
+                                div()
+                                  .flex_none()
+                                  .px(5)
+                                  .py(0.5)
+                                  .rounded(3)
+                                  .bg(withAlpha(typeCol, "18") || t.surface)
+                                  .text_size(9.5)
+                                  .text_color(typeCol)
+                                  .child(it.type || "feature")
+                              )
+                              .when(Boolean(it.target_repo), (rp) =>
+                                rp.child(
+                                  div()
+                                    .flex_none()
+                                    .px(5)
+                                    .py(0.5)
+                                    .rounded(3)
+                                    .bg(t.surface)
+                                    .text_size(9.5)
+                                    .text_color(t.muted)
+                                    .child(it.target_repo)
+                                )
+                              )
+                              .child(
+                                div()
+                                  .flex_1()
+                                  .min_w(0)
+                                  .text_size(11.5)
+                                  .text_color(t.foreground)
+                                  .truncate()
+                                  .child(it.clean_title || it.title)
+                              )
+                          )
+                          .child(
+                            h_flex()
+                              .items_center()
+                              .flex_none()
+                              .gap(4)
+                              .when(Boolean(it.cura_build), (cb) =>
+                                cb.child(
+                                  div()
+                                    .px(5)
+                                    .py(1)
+                                    .rounded(4)
+                                    .bg(withAlpha(curaCol, "18") || t.surface)
+                                    .border_1()
+                                    .border_color(withAlpha(curaCol, "60") || curaCol)
+                                    .text_size(9.5)
+                                    .font_semibold()
+                                    .text_color(curaCol)
+                                    .child(`Cura ${shortBuildVersion(it.cura_build)}`)
+                                )
+                              )
+                              .when(Boolean(it.firmware_build), (fb) =>
+                                fb.child(
+                                  div()
+                                    .px(5)
+                                    .py(1)
+                                    .rounded(4)
+                                    .bg(withAlpha(fwCol, "18") || t.surface)
+                                    .border_1()
+                                    .border_color(withAlpha(fwCol, "60") || fwCol)
+                                    .text_size(9.5)
+                                    .font_semibold()
+                                    .text_color(fwCol)
+                                    .child(`FW ${shortBuildVersion(it.firmware_build)}`)
+                                )
+                              )
+                          );
+                      })
+                    )
+                );
+            })
           )
       );
   }
@@ -4686,21 +5750,111 @@ export default class KanbanBoard extends View {
                           .text_color(t.muted)
                           .child("Specification & Notes")
                       )
+                      .when(
+                        Boolean(
+                          isDoneTicket ||
+                            resolveTicketBuilds(ticket).curaBuild ||
+                            resolveTicketBuilds(ticket).firmwareBuild
+                        ),
+                        (bRow) => {
+                          const bi = resolveTicketBuilds(ticket);
+                          const curaCol = t.done || t.ansi2 || "#10b981";
+                          const fwCol = t.accent || "#4c8bf5";
+                          const warnCol = t.working || t.ansi3 || "#d97736";
+                          return bRow
+                            .when(Boolean(bi.curaBuild), (el) =>
+                              el.child(
+                                div()
+                                  .id("insp-cura-build-pill")
+                                  .flex_none()
+                                  .px(6)
+                                  .py(1)
+                                  .rounded(4)
+                                  .cursor_pointer()
+                                  .bg(withAlpha(curaCol, "1C") || t.background)
+                                  .border_1()
+                                  .border_color(withAlpha(curaCol, "70") || curaCol)
+                                  .text_size(10)
+                                  .font_semibold()
+                                  .text_color(curaCol)
+                                  .hover((s) => s.bg(t.hover))
+                                  .on_click((_ev, cx) =>
+                                    this.jumpToBuildChangelog("cura", bi.curaBuild, cx)
+                                  )
+                                  .child(`Cura Build: ${shortBuildVersion(bi.curaBuild)}`)
+                              )
+                            )
+                            .when(Boolean(bi.firmwareBuild), (el) =>
+                              el.child(
+                                div()
+                                  .id("insp-fw-build-pill")
+                                  .flex_none()
+                                  .px(6)
+                                  .py(1)
+                                  .rounded(4)
+                                  .cursor_pointer()
+                                  .bg(withAlpha(fwCol, "1C") || t.background)
+                                  .border_1()
+                                  .border_color(withAlpha(fwCol, "70") || fwCol)
+                                  .text_size(10)
+                                  .font_semibold()
+                                  .text_color(fwCol)
+                                  .hover((s) => s.bg(t.hover))
+                                  .on_click((_ev, cx) =>
+                                    this.jumpToBuildChangelog("firmware", bi.firmwareBuild, cx)
+                                  )
+                                  .child(`Firmware Build: ${shortBuildVersion(bi.firmwareBuild)}`)
+                              )
+                            )
+                            .when(
+                              Boolean(
+                                isDoneTicket &&
+                                  !bi.curaBuild &&
+                                  !bi.firmwareBuild &&
+                                  !bi.isBaseline &&
+                                  !bi.isReleaseTicket
+                              ),
+                              (el) =>
+                                el.child(
+                                  div()
+                                    .id("insp-pending-build-pill")
+                                    .flex_none()
+                                    .px(6)
+                                    .py(1)
+                                    .rounded(4)
+                                    .cursor_pointer()
+                                    .bg(withAlpha(warnCol, "1C") || t.background)
+                                    .border_1()
+                                    .border_color(withAlpha(warnCol, "70") || warnCol)
+                                    .text_size(10)
+                                    .font_semibold()
+                                    .text_color(warnCol)
+                                    .on_click((_ev, cx) =>
+                                      this.syncBus({ viewMode: "changelog" }, cx)
+                                    )
+                                    .child("Build: Merged (Pending Next Release Build)")
+                                )
+                            );
+                        }
+                      )
                       .when(Array.isArray(ticket.labels) && ticket.labels.length > 0, (l) =>
                         l.children(
-                          ticket.labels.slice(0, 5).map((lbl, idx) => {
-                            const fc = parseFacetLabel(lbl, t);
-                            return div()
-                              .id(`desc-lbl-${idx}`)
-                              .flex_none()
-                              .px(5)
-                              .py(1)
-                              .rounded(4)
-                              .bg(fc.bg)
-                              .text_size(9.5)
-                              .text_color(fc.color)
-                              .child(truncStr(lbl, 20));
-                          })
+                          ticket.labels
+                            .filter((lbl) => !String(lbl).startsWith("release:"))
+                            .slice(0, 5)
+                            .map((lbl, idx) => {
+                              const fc = parseFacetLabel(lbl, t);
+                              return div()
+                                .id(`desc-lbl-${idx}`)
+                                .flex_none()
+                                .px(5)
+                                .py(1)
+                                .rounded(4)
+                                .bg(fc.bg)
+                                .text_size(9.5)
+                                .text_color(fc.color)
+                                .child(truncStr(lbl, 20));
+                            })
                         )
                       )
                   )
@@ -4743,11 +5897,19 @@ export default class KanbanBoard extends View {
       this.viewMode === "whats_new"
         ? [
             ["s", "summarize"],
+            ["g", "changelog"],
             ["b", "board"],
+            ["r", "refresh"],
+          ]
+        : this.viewMode === "changelog"
+        ? [
+            ["b", "board"],
+            ["w", "what's new"],
             ["r", "refresh"],
           ]
         : [
             ["hjkl", "nav"],
+            ["g", "changelog"],
             ["w", "what's new"],
             ["n", "deposit"],
           ];
@@ -4872,6 +6034,12 @@ export default class KanbanBoard extends View {
       this.quickFilter = this.bus.quickFilter || "active";
       this.compactEmpty = this.bus.compactEmpty !== false;
       this.viewMode = this.bus.viewMode || "board";
+      this.changelogTrain = this.bus.changelogTrain || "all";
+      this.changelogType = this.bus.changelogType || "all";
+      this.changelogFwFrom = this.bus.changelogFwFrom || "";
+      this.changelogFwTo = this.bus.changelogFwTo || "";
+      this.changelogCuraFrom = this.bus.changelogCuraFrom || "";
+      this.changelogCuraTo = this.bus.changelogCuraTo || "";
       this.agentKind = this.bus.agentKind;
       this.overrideSpaceId = this.bus.overrideSpaceId;
       this.showDrawer = this.bus.showDrawer !== false;
@@ -5014,12 +6182,21 @@ export default class KanbanBoard extends View {
           .when(Boolean(this.board && this.viewMode === "whats_new"), (d) =>
             d.child(this.renderWhatsNewView(t))
           )
-          .when(Boolean(this.board && this.viewMode !== "whats_new"), (d) =>
-            d
-              .when(!this.showDrawer || !this.drawerTall, (col) =>
-                col.child(this.renderBoardCanvas(byCol, selectedRef, t))
-              )
-              .child(this.renderInspector(selected, t))
+          .when(Boolean(this.board && this.viewMode === "changelog"), (d) =>
+            d.child(this.renderChangelogView(t))
+          )
+          .when(
+            Boolean(
+              this.board &&
+                this.viewMode !== "whats_new" &&
+                this.viewMode !== "changelog"
+            ),
+            (d) =>
+              d
+                .when(!this.showDrawer || !this.drawerTall, (col) =>
+                  col.child(this.renderBoardCanvas(byCol, selectedRef, t))
+                )
+                .child(this.renderInspector(selected, t))
           )
       )
       .child(this.renderFooter(t, tgt));

@@ -18,7 +18,7 @@ from .engine import (
     KanbanError,
     RepoContext,
 )
-from .model import Column, Ticket, strip_meta
+from .model import Column, Ticket, short_build_version, strip_meta
 
 UI_GROUPS: tuple[tuple[str, tuple[Column, ...]], ...] = (
     ("Triage", (Column.TRIAGE,)),
@@ -382,7 +382,20 @@ class BoardTUI:
             return [terminal.pad_ansi(line1, width)]
 
         skey = self._state_key(ticket)
+        binfo = ticket.build_info()
         badges: list[str] = []
+        if ticket.column == Column.DONE:
+            if binfo["cura_build"]:
+                badges.append(terminal.green(f"Cura:{short_build_version(binfo['cura_build'])}"))
+            if binfo["firmware_build"]:
+                badges.append(terminal.cyan(f"FW:{short_build_version(binfo['firmware_build'])}"))
+            if (
+                not binfo["cura_build"]
+                and not binfo["firmware_build"]
+                and not binfo["is_baseline"]
+                and not binfo["is_release_ticket"]
+            ):
+                badges.append(terminal.yellow("Pending-Build"))
         if ticket.priority:
             badges.append(terminal.yellow(ticket.priority))
         if ticket.target_repo and ticket.target_repo != ticket.repo_alias:
@@ -455,6 +468,19 @@ class BoardTUI:
         lines = [sep, hdr]
 
         meta_parts: list[str] = []
+        binfo = ticket.build_info()
+        if binfo["cura_build"]:
+            meta_parts.append(f"Cura: {terminal.green(short_build_version(binfo['cura_build']))}")
+        if binfo["firmware_build"]:
+            meta_parts.append(f"FW: {terminal.cyan(short_build_version(binfo['firmware_build']))}")
+        if (
+            ticket.column == Column.DONE
+            and not binfo["cura_build"]
+            and not binfo["firmware_build"]
+            and not binfo["is_baseline"]
+            and not binfo["is_release_ticket"]
+        ):
+            meta_parts.append(f"Build: {terminal.yellow('Pending Next Build')}")
         if ticket.priority:
             meta_parts.append(f"Prio: {terminal.yellow(ticket.priority)}")
         if ticket.milestone:

@@ -405,6 +405,123 @@ class FileOverlap:
     files: list[str]
 
 
+_RELEASED_IN_RE = re.compile(
+    r"Released-In:.*?\(\s*(slicer|cura|firmware|ultimoco)\s*:\s*`?([0-9]+\.[0-9]+\.[0-9]+[^\s`)]*)`?\s*\)",
+    re.IGNORECASE,
+)
+_SEMVER_TOKEN_RE = re.compile(r"(\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?(?:\+[A-Za-z0-9.]+)?)")
+
+
+def parse_semver_sort_key(version_str: str) -> tuple[int, int, int, int, str]:
+    """Return a chronological sort key `(major, minor, patch, pre_num, raw)` for build versions."""
+    raw = (version_str or "").strip().lstrip("vV")
+    base_part, _, _ = raw.partition("+")
+    core_part, _, pre_part = base_part.partition("-")
+    nums = [int(x) for x in re.findall(r"\d+", core_part)]
+    while len(nums) < 3:
+        nums.append(0)
+    pre_num = 999999
+    if pre_part:
+        pre_digits = [int(x) for x in re.findall(r"\d+", pre_part)]
+        pre_num = pre_digits[-1] if pre_digits else 0
+    return (nums[0], nums[1], nums[2], pre_num, raw)
+
+
+def short_build_version(version_str: str) -> str:
+    """Return compact human-readable version without `+unimotion` build metadata suffix."""
+    raw = (version_str or "").strip()
+    if not raw:
+        return ""
+    return re.sub(r"\+[A-Za-z0-9._-]+$", "", raw)
+
+
+def extract_ticket_builds(
+    labels: list[str] | None,
+    body: str | None = "",
+    title: str | None = "",
+    cura_field: str = "",
+    firmware_field: str = "",
+) -> dict[str, Any]:
+    """Extract Firmware and Cura build versions from labels, body, title, and Project fields."""
+    lbl_list = [str(x).strip() for x in (labels or []) if str(x).strip()]
+    body_text = str(body or "")
+    title_text = str(title or "")
+
+    cura_set: set[str] = set()
+    fw_set: set[str] = set()
+    other_releases: list[str] = []
+    is_baseline = False
+    is_release_ticket = (
+        "[release]" in title_text.lower()
+        or "release-ticket:true" in body_text.lower()
+        or "type:release" in {x.lower() for x in lbl_list}
+    )
+
+    for lbl in lbl_list:
+        low = lbl.lower()
+        if low == "release:baseline":
+            is_baseline = True
+        elif low.startswith(("release:cura-", "release:slicer-")):
+            ver = lbl.split("-", 1)[1].strip()
+            if ver:
+                cura_set.add(ver)
+        elif low.startswith(("release:ultimoco-", "release:firmware-")):
+            ver = lbl.split("-", 1)[1].strip()
+            if ver:
+                fw_set.add(ver)
+        elif low.startswith("release:"):
+            val = lbl.split(":", 1)[1].strip()
+            if val and val not in other_releases:
+                other_releases.append(val)
+
+    for match in _RELEASED_IN_RE.finditer(body_text):
+        train_tok = match.group(1).lower()
+        ver_tok = match.group(2).strip()
+        if not ver_tok:
+            continue
+        if train_tok in ("slicer", "cura"):
+            cura_set.add(ver_tok)
+        elif train_tok in ("firmware", "ultimoco"):
+            fw_set.add(ver_tok)
+
+    if is_release_ticket:
+        ver_m = _SEMVER_TOKEN_RE.search(title_text)
+        if ver_m:
+            ver_val = ver_m.group(1)
+            t_low = title_text.lower()
+            if "cura" in t_low or "slicer" in t_low or "cura-13401" in t_low:
+                cura_set.add(ver_val)
+            elif "ultimoco" in t_low or "firmware" in t_low or "emb-476" in t_low:
+                fw_set.add(ver_val)
+
+    for raw_field, target_set in ((cura_field, cura_set), (firmware_field, fw_set)):
+        cleaned = (raw_field or "").strip()
+        if not cleaned or cleaned in ("-", "none", "N/A"):
+            continue
+        if cleaned.lower().startswith(("pending", "unreleased")):
+            continue
+        if cleaned.lower() == "baseline":
+            is_baseline = True
+            continue
+        for part in cleaned.split(","):
+            tok = part.strip()
+            m = _SEMVER_TOKEN_RE.search(tok)
+            if m:
+                target_set.add(m.group(1))
+
+    cura_builds = sorted(cura_set, key=parse_semver_sort_key)
+    fw_builds = sorted(fw_set, key=parse_semver_sort_key)
+    return {
+        "cura_builds": cura_builds,
+        "firmware_builds": fw_builds,
+        "cura_build": cura_builds[0] if cura_builds else "",
+        "firmware_build": fw_builds[0] if fw_builds else "",
+        "is_baseline": is_baseline,
+        "is_release_ticket": is_release_ticket,
+        "other_releases": other_releases,
+    }
+
+
 @dataclass(slots=True)
 class Ticket:
     number: int
@@ -418,6 +535,8 @@ class Ticket:
     priority: str = ""
     milestone: str = ""
     target_repo: str = ""
+    cura_build: str = ""
+    firmware_build: str = ""
     depends_on: list[int] = field(default_factory=list)
     blocks: list[int] = field(default_factory=list)
     unmet_deps: list[int] = field(default_factory=list)
@@ -454,7 +573,17 @@ class Ticket:
             return ("target", self.deposit.target_repo.lower())
         return self.repo_key()
 
+    def build_info(self) -> dict[str, Any]:
+        return extract_ticket_builds(
+            self.labels,
+            self.body,
+            self.title,
+            cura_field=self.cura_build,
+            firmware_field=self.firmware_build,
+        )
+
     def to_dict(self) -> dict[str, Any]:
+        binfo = self.build_info()
         return {
             "number": self.number,
             "title": self.title,
@@ -470,6 +599,12 @@ class Ticket:
             "labels": list(self.labels),
             "priority": self.priority,
             "milestone": self.milestone,
+            "cura_build": binfo["cura_build"] or self.cura_build,
+            "firmware_build": binfo["firmware_build"] or self.firmware_build,
+            "cura_builds": binfo["cura_builds"],
+            "firmware_builds": binfo["firmware_builds"],
+            "is_baseline": binfo["is_baseline"],
+            "is_release_ticket": binfo["is_release_ticket"],
             "depends_on": list(self.depends_on),
             "blocks": list(self.blocks),
             "unmet_deps": list(self.unmet_deps),

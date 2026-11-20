@@ -263,3 +263,47 @@ def test_generic_taxonomy_ready_gate_and_dependency_waves() -> None:
     cyc = detect_dependency_cycle({1: {2}, 2: {3}, 3: {1}})
     assert cyc == [1, 2, 3, 1]
     assert detect_dependency_cycle({1: set(), 2: {1}, 3: {2}}) is None
+
+
+def test_extract_ticket_builds_and_short_versions() -> None:
+    from herdr_kanban.model import extract_ticket_builds, short_build_version
+
+    assert short_build_version("5.15.0-alpha.44+unimotion") == "5.15.0-alpha.44"
+    assert short_build_version("12.0.0-alpha.17+unimotion") == "12.0.0-alpha.17"
+
+    # Cross-train ticket with both release labels
+    b1 = extract_ticket_builds(
+        [
+            "domain:slicing",
+            "domain:rt-control",
+            "type:bug",
+            "release:cura-5.15.0-alpha.44+unimotion",
+            "release:ultimoco-12.0.0-alpha.17+unimotion",
+        ],
+        "Jira: CURA-13401, EMB-476.",
+        "[EMB-476][CURA-13401] Fix concentric G3 seam notch",
+    )
+    assert b1["cura_build"] == "5.15.0-alpha.44+unimotion"
+    assert b1["firmware_build"] == "12.0.0-alpha.17+unimotion"
+    assert not b1["is_baseline"]
+    assert not b1["is_release_ticket"]
+
+    # Ticket whose build is recorded via Released-In body line or Project field
+    b2 = extract_ticket_builds(
+        ["domain:slicing", "type:bug"],
+        "Jira: CURA-13401.\n\n- Released-In: unimotion#209 (slicer: `5.15.0-alpha.41+unimotion`)",
+        "Fix Layer-0 flow compounding",
+        firmware_field="12.0.0-alpha.15+unimotion",
+    )
+    assert b2["cura_build"] == "5.15.0-alpha.41+unimotion"
+    assert b2["firmware_build"] == "12.0.0-alpha.15+unimotion"
+
+    # Release ticket itself
+    b3 = extract_ticket_builds(
+        ["domain:som", "type:chore"],
+        "release-ticket:true",
+        "[EMB-476][release] Ultimoco C++23 12.0.0-alpha.17+unimotion",
+    )
+    assert b3["is_release_ticket"]
+    assert b3["firmware_build"] == "12.0.0-alpha.17+unimotion"
+

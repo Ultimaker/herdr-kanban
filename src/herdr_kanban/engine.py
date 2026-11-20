@@ -18,7 +18,7 @@ from .git_ops import GitClient, GitError
 from .github import GitHubClient, GitHubError, ProjectSchema
 from .herdr import HerdrClient, current_pane_id, current_scope
 from .model import (
-     COLUMN_TITLES,
+    COLUMN_TITLES,
     ClaimMeta,
     Column,
     DepositMeta,
@@ -31,6 +31,7 @@ from .model import (
     is_lease_expired,
     lease_until_iso,
     parse_body_dependencies,
+    parse_semver_sort_key,
     parse_ticket_ref,
     populate_dependency_waves,
     populate_file_overlaps,
@@ -38,6 +39,7 @@ from .model import (
     render_deposit_body,
     render_relay_comment,
     resolve_winning_claim,
+    short_build_version,
     strip_meta,
     utc_now_iso,
     validate_ready_gate,
@@ -568,6 +570,51 @@ class KanbanEngine:
         done = sum(1 for b in boxes if b.lower() == "x")
         return done, len(boxes)
 
+    @staticmethod
+    def _infer_ticket_trains(ticket: Ticket) -> list[str]:
+        """Infer which release train(s) (`cura`, `firmware`) a ticket targets."""
+        slicer_repos = {
+            "cura-unimotion",
+            "curaengine-unimotion",
+            "uranium-unimotion",
+            "curamcp",
+            "curator",
+            "neoprep",
+            "fdm_materials",
+            "fdm_materials_private",
+            "cura-private-data",
+        }
+        firmware_repos = {
+            "ultimoco",
+            "opinicus",
+            "okuda",
+            "misp-service",
+            "print-process-reporting",
+            "marvin-service",
+            "python3-uc-firmware-upgrade",
+            "ultitools",
+            "bench-telemetry",
+            "stardust-printer_console",
+            "misc-product-specific",
+            "jedi-build",
+            "jedi-cookbook",
+        }
+        labels = {str(x).lower() for x in ticket.labels}
+        target_repo = (ticket.target_repo or ticket.repo_alias or ticket.repo_name or "").lower()
+        trains: list[str] = []
+        if target_repo in slicer_repos or "domain:slicing" in labels or "domain:wire-contract" in labels:
+            trains.append("cura")
+        fw_domains = {"domain:rt-control", "domain:som", "domain:digital-twin", "domain:wire-contract"}
+        if target_repo in firmware_repos or bool(labels & fw_domains):
+            trains.append("firmware")
+        if not trains:
+            combined = f"{ticket.title} {ticket.body}".upper()
+            if "CURA-13401" in combined:
+                trains.append("cura")
+            if "EMB-476" in combined:
+                trains.append("firmware")
+        return trains or ["cura"]
+
     def serialize_ticket_for_board(
         self,
         ctx: RepoContext,
@@ -591,6 +638,16 @@ class KanbanEngine:
         done_cnt, total_cnt = self._checklist_counts(ticket)
         row["checklist_done"] = done_cnt
         row["checklist_total"] = total_cnt
+        if (
+            ticket.column == Column.DONE
+            and not row.get("cura_build")
+            and not row.get("firmware_build")
+            and not row.get("is_baseline")
+            and not row.get("is_release_ticket")
+        ):
+            row["unreleased_trains"] = self._infer_ticket_trains(ticket)
+        else:
+            row["unreleased_trains"] = []
         return row
 
     def build_board_payload(
@@ -656,6 +713,7 @@ class KanbanEngine:
             "local_claims": [c.to_dict() for c in all_local],
             "tickets": [self.serialize_ticket_for_board(ctx, t, local_by_key) for t in tickets],
             "whats_new": self.build_whats_new_digest(ctx, tickets),
+            "changelog": self.build_release_changelog(ctx, tickets),
         }
         return payload
 
@@ -1130,6 +1188,350 @@ class KanbanEngine:
                 lines.append(f"  Summary: {item['summary_note']}")
         return "\n".join(lines)
 
+    @staticmethod
+    def _match_version_index(versions: list[str], query: str) -> int | None:
+        """Resolve a version query (`alpha.12`, `12`, `12.0.0-alpha.12`, `unreleased`) to an index."""
+        q = (query or "").strip().lower().lstrip("v")
+        if not q:
+            return None
+        for idx, ver in enumerate(versions):
+            v_low = ver.lower()
+            v_short = short_build_version(ver).lower()
+            if q in (v_low, v_short):
+                return idx
+        # Match `alpha.<N>` or bare `<N>` against `-alpha.<N>`
+        num_m = re.match(r"^(?:alpha[._-]?)?(\d+)$", q)
+        if num_m:
+            target_alpha = f"alpha.{num_m.group(1)}"
+            for idx, ver in enumerate(versions):
+                v_short = short_build_version(ver).lower()
+                if v_short.endswith(f"-{target_alpha}") or f"-{target_alpha}+" in ver.lower():
+                    return idx
+        for idx, ver in enumerate(versions):
+            if q in ver.lower():
+                return idx
+        return None
+
+    def build_release_changelog(
+        self,
+        ctx: RepoContext,
+        tickets: list[Ticket],
+        *,
+        train: str = "all",
+        from_version: str = "",
+        to_version: str = "",
+        search: str = "",
+        repo: str = "",
+        ticket_type: str = "",
+    ) -> dict[str, Any]:
+        """Build structured changelog across Firmware (`ultimoco`) and Cura (`slicer`) builds."""
+        norm_train = (train or "all").strip().lower()
+        if norm_train in ("slicer", "cura-unimotion"):
+            norm_train = "cura"
+        elif norm_train in ("ultimoco", "fw"):
+            norm_train = "firmware"
+
+        done_tickets = [t for t in tickets if t.column == Column.DONE]
+
+        release_ticket_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        tickets_by_build: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        fw_versions_set: set[str] = set()
+        cura_versions_set: set[str] = set()
+
+        companion_re = re.compile(
+            r"Companion Release Ticket\*\*:\s*`?((?:[A-Za-z0-9_.-]+)?#\d+)`?\s*(?:\(`?([^`)\s]+)`?\))?",
+            re.IGNORECASE,
+        )
+        released_at_re = re.compile(r"Released\s*&\s*Deployed\s*\(([^)]+)\)", re.IGNORECASE)
+
+        for t in done_tickets:
+            binfo = t.build_info()
+            ref_str = t.ref(ctx.is_multi_repo)
+            cli_ref = (
+                f"{t.repo_alias}#{t.number}"
+                if (ctx.is_multi_repo and t.repo_alias)
+                else str(t.number)
+            )
+            if binfo["is_release_ticket"]:
+                comp_m = companion_re.search(t.body or "")
+                rel_at_m = released_at_re.search(t.body or "")
+                fallback_date = t.updated_at[:10] if t.updated_at else ""
+                rel_date = rel_at_m.group(1).strip() if rel_at_m else fallback_date
+                rt_meta = {
+                    "number": t.number,
+                    "ref": ref_str,
+                    "cli_ref": cli_ref,
+                    "title": t.title,
+                    "updated_at": t.updated_at,
+                    "released_at": rel_date,
+                    "companion_ref": comp_m.group(1).strip() if comp_m else "",
+                    "companion_version": (comp_m.group(2) or "").strip() if comp_m else "",
+                }
+                for ver in binfo["firmware_builds"]:
+                    fw_versions_set.add(ver)
+                    release_ticket_by_key[("firmware", ver)] = rt_meta
+                for ver in binfo["cura_builds"]:
+                    cura_versions_set.add(ver)
+                    release_ticket_by_key[("cura", ver)] = rt_meta
+                continue
+
+            clean_title, jira_keys, scopes = self._split_ticket_prefixes(t.title)
+            owner = (
+                (t.claim.owner if t.claim and t.claim.owner else "")
+                or (t.deposit.deposited_by if t.deposit and t.deposit.deposited_by else "")
+                or t.author
+                or "team"
+            )
+            agent = t.claim.agent_kind if t.claim and t.claim.agent_kind else ""
+            repo_key = t.target_repo or t.repo_alias or t.repo_name or ctx.repo_name
+            t_type = next(
+                (lbl.split(":", 1)[1] for lbl in t.labels if lbl.startswith("type:")),
+                "feature",
+            )
+            t_domains = [lbl.split(":", 1)[1] for lbl in t.labels if lbl.startswith("domain:")]
+
+            item = {
+                "number": t.number,
+                "ref": ref_str,
+                "cli_ref": cli_ref,
+                "title": t.title,
+                "clean_title": clean_title,
+                "jira_keys": jira_keys,
+                "scopes": scopes,
+                "target_repo": repo_key,
+                "priority": t.priority,
+                "milestone": t.milestone,
+                "type": t_type,
+                "domains": t_domains,
+                "owner": owner,
+                "agent_kind": agent,
+                "updated_at": t.updated_at,
+                "summary_note": self._extract_ticket_summary_note(t),
+                "labels": list(t.labels),
+                "cura_build": binfo["cura_build"],
+                "firmware_build": binfo["firmware_build"],
+                "cura_builds": binfo["cura_builds"],
+                "firmware_builds": binfo["firmware_builds"],
+                "is_baseline": binfo["is_baseline"],
+                "unreleased_trains": [],
+            }
+
+            if binfo["firmware_builds"] or binfo["cura_builds"]:
+                for ver in binfo["firmware_builds"]:
+                    fw_versions_set.add(ver)
+                    tickets_by_build.setdefault(("firmware", ver), []).append(item)
+                for ver in binfo["cura_builds"]:
+                    cura_versions_set.add(ver)
+                    tickets_by_build.setdefault(("cura", ver), []).append(item)
+            elif not binfo["is_baseline"]:
+                inferred = self._infer_ticket_trains(t)
+                item["unreleased_trains"] = inferred
+                for tr_name in inferred:
+                    tickets_by_build.setdefault((tr_name, "unreleased"), []).append(item)
+
+        fw_versions = sorted(fw_versions_set, key=parse_semver_sort_key)
+        cura_versions = sorted(cura_versions_set, key=parse_semver_sort_key)
+        if ("firmware", "unreleased") in tickets_by_build:
+            fw_versions.append("unreleased")
+        if ("cura", "unreleased") in tickets_by_build:
+            cura_versions.append("unreleased")
+
+        def _filter_version_slice(ver_list: list[str], is_target_train: bool) -> list[str]:
+            if not ver_list:
+                return []
+            if not is_target_train:
+                return []
+            lo = 0
+            hi = len(ver_list) - 1
+            if from_version:
+                m_lo = self._match_version_index(ver_list, from_version)
+                if m_lo is not None:
+                    lo = m_lo
+            if to_version:
+                m_hi = self._match_version_index(ver_list, to_version)
+                if m_hi is not None:
+                    hi = m_hi
+            if lo > hi:
+                lo, hi = hi, lo
+            return ver_list[lo : hi + 1]
+
+        include_fw = norm_train in ("all", "firmware")
+        include_cura = norm_train in ("all", "cura")
+        selected_fw_versions = _filter_version_slice(fw_versions, include_fw)
+        selected_cura_versions = _filter_version_slice(cura_versions, include_cura)
+
+        q_lc = (search or "").strip().lower()
+        repo_lc = (repo or "").strip().lower()
+        type_lc = (ticket_type or "").strip().lower()
+
+        def _item_matches(it: dict[str, Any]) -> bool:
+            if repo_lc and it["target_repo"].lower() != repo_lc:
+                return False
+            if type_lc and type_lc != "all" and it["type"].lower() != type_lc:
+                return False
+            if not q_lc:
+                return True
+            haystack = " ".join(
+                [
+                    it["ref"],
+                    str(it["number"]),
+                    it["title"],
+                    it["target_repo"],
+                    it["cura_build"],
+                    it["firmware_build"],
+                    " ".join(it["labels"]),
+                    it["owner"],
+                ]
+            ).lower()
+            return q_lc in haystack
+
+        builds_out: list[dict[str, Any]] = []
+        for tr_name, ver_list in (
+            ("firmware", list(reversed(selected_fw_versions))),
+            ("cura", list(reversed(selected_cura_versions))),
+        ):
+            for ver in ver_list:
+                full_list = fw_versions if tr_name == "firmware" else cura_versions
+                ver_idx = full_list.index(ver)
+                prev_ver = full_list[ver_idx - 1] if ver_idx > 0 else "baseline"
+                raw_items = sorted(
+                    tickets_by_build.get((tr_name, ver), []),
+                    key=lambda x: (self.priority_rank(ctx, x.get("priority", "")), x["number"]),
+                )
+                filtered_items = [it for it in raw_items if _item_matches(it)]
+                if (q_lc or repo_lc or (type_lc and type_lc != "all")) and not filtered_items:
+                    continue
+                rt_info = release_ticket_by_key.get((tr_name, ver))
+                disp_name = (
+                    "Ultimoco C++23 Firmware"
+                    if tr_name == "firmware"
+                    else "Cura-unimotion Slicer"
+                )
+                short_ver = (
+                    "Unreleased (Pending Next Build)"
+                    if ver == "unreleased"
+                    else short_build_version(ver)
+                )
+                prev_short = (
+                    short_build_version(prev_ver) if prev_ver != "baseline" else "baseline"
+                )
+                bugs_cnt = sum(1 for x in filtered_items if x["type"] == "bug")
+                feat_cnt = sum(1 for x in filtered_items if x["type"] == "feature")
+                for_cnt = sum(1 for x in filtered_items if x["type"] == "forensics")
+                other_cnt = len(filtered_items) - bugs_cnt - feat_cnt - for_cnt
+                builds_out.append(
+                    {
+                        "train": tr_name,
+                        "train_display": disp_name,
+                        "version": ver,
+                        "short_version": short_ver,
+                        "previous_version": prev_ver,
+                        "previous_short_version": prev_short,
+                        "is_unreleased": ver == "unreleased",
+                        "release_ticket": rt_info,
+                        "tickets": filtered_items,
+                        "total_unfiltered": len(raw_items),
+                        "counts": {
+                            "total": len(filtered_items),
+                            "bugs": bugs_cnt,
+                            "features": feat_cnt,
+                            "forensics": for_cnt,
+                            "other": other_cnt,
+                        },
+                    }
+                )
+
+        # Sort combined builds so newest releases appear first
+        def _build_sort_key(b: dict[str, Any]) -> tuple[int, str, int]:
+            is_unrel = 1 if b["is_unreleased"] else 0
+            rt = b.get("release_ticket") or {}
+            ts = str(rt.get("updated_at") or "")
+            _, _, _, alpha_num, _ = parse_semver_sort_key(b["version"])
+            return (is_unrel, ts, alpha_num)
+
+        builds_out.sort(key=_build_sort_key, reverse=True)
+
+        unique_tickets: dict[int, dict[str, Any]] = {}
+        for b in builds_out:
+            for it in b["tickets"]:
+                unique_tickets[it["number"]] = it
+
+        rel_fw = [v for v in fw_versions if v != "unreleased"]
+        rel_cura = [v for v in cura_versions if v != "unreleased"]
+        fw_span = (
+            f" (`{short_build_version(rel_fw[0])}` → `{short_build_version(rel_fw[-1])}`)"
+            if rel_fw
+            else ""
+        )
+        cura_span = (
+            f" (`{short_build_version(rel_cura[0])}` → `{short_build_version(rel_cura[-1])}`)"
+            if rel_cura
+            else ""
+        )
+
+        md_lines: list[str] = [
+            f"# Release & Build Changelog — {ctx.display_name}",
+            "",
+            f"- **Firmware Builds (`Ultimoco C++23`)**: `{len(rel_fw)}` releases{fw_span}",
+            (
+                "- **Cura Builds (`Cura-unimotion` + `CuraEngine-unimotion`)**: "
+                f"`{len(rel_cura)}` releases{cura_span}"
+            ),
+            (
+                "- **Matched Tickets in Selection**: "
+                f"`{len(unique_tickets)}` ticket(s) across `{len(builds_out)}` build(s)"
+            ),
+            "",
+        ]
+        for b in builds_out:
+            rt = b.get("release_ticket")
+            rt_suffix = f" ({rt['ref']})" if rt else ""
+            comp_suffix = (
+                f" · Companion: `{short_build_version(rt['companion_version'])}` ({rt['companion_ref']})"
+                if (rt and rt.get("companion_version"))
+                else ""
+            )
+            hdr_ver = (
+                "Unreleased (Merged on Branch — Pending Next Build)"
+                if b["is_unreleased"]
+                else f"`{b['version']}` (since `{b['previous_version']}`)"
+            )
+            tr_upper = b["train"].upper()
+            md_lines.append(f"## [{tr_upper}] {b['train_display']} — {hdr_ver}{rt_suffix}{comp_suffix}")
+            if not b["tickets"]:
+                md_lines.append("- *(Version bump / rebuild with 0 newly collected tickets)*")
+            else:
+                for it in b["tickets"]:
+                    build_tags: list[str] = []
+                    if it.get("cura_build"):
+                        build_tags.append(f"Cura: `{short_build_version(it['cura_build'])}`")
+                    if it.get("firmware_build"):
+                        build_tags.append(f"FW: `{short_build_version(it['firmware_build'])}`")
+                    if not build_tags and it.get("unreleased_trains"):
+                        build_tags.append(f"Pending next {'/'.join(it['unreleased_trains'])} build")
+                    btag_str = f" [{', '.join(build_tags)}]" if build_tags else ""
+                    meta_tag = f"(`{it['target_repo']}`, `{it['type']}`, {it['priority'] or '-'})"
+                    md_lines.append(
+                        f"- **[{it['ref']}](kanban://issue/{it['cli_ref']})** {meta_tag} "
+                        f"{it['clean_title']}{btag_str}"
+                    )
+            md_lines.append("")
+
+        return {
+            "train": norm_train,
+            "from_version": from_version,
+            "to_version": to_version,
+            "search": search,
+            "repo": repo,
+            "firmware_versions": fw_versions,
+            "cura_versions": cura_versions,
+            "selected_firmware_versions": selected_fw_versions,
+            "selected_cura_versions": selected_cura_versions,
+            "total_unique_tickets": len(unique_tickets),
+            "builds": builds_out,
+            "markdown": "\n".join(md_lines).strip() + "\n",
+        }
+
 
     def sync_labels(self, ctx: RepoContext) -> dict[str, Any]:
         """Provision configured taxonomy labels, milestones, and Project v2 Priority options."""
@@ -1172,11 +1574,23 @@ class KanbanEngine:
                 project_id=schema.project_id,
             )
 
+        build_fields: list[str] = []
+        if schema.project_id:
+            if not schema.cura_build_field_id:
+                fid = self.github.ensure_text_field(schema.project_id, "Cura Build")
+                if fid:
+                    build_fields.append("Cura Build")
+            if not schema.firmware_build_field_id:
+                fid = self.github.ensure_text_field(schema.project_id, "Firmware Build")
+                if fid:
+                    build_fields.append("Firmware Build")
+
         return {
             "issues_repo": f"{issues_entry.owner}/{issues_entry.repo}",
             "labels": label_results,
             "milestones": milestone_results,
             "added_priorities": added_priorities,
+            "added_build_fields": build_fields,
         }
 
     def sync_repos(self, ctx: RepoContext, *, create_branches: bool = False) -> list[dict[str, str]]:
@@ -1973,6 +2387,12 @@ class KanbanEngine:
         if target_local is not None:
             target_handle = target_local.agent_name or target_local.pane_id
             delivered_fast = self.herdr.prompt_if_idle(target_handle, wakeup_text)
+            trusted_set = self.github.trusted_collaborators(
+                to_entry.owner,
+                to_entry.repo,
+                ctx.board.trusted_authors,
+            )
+            is_trusted = bool(user and user.lower() in trusted_set)
             state.append_inbox_item(
                 to_entry.slug,
                 InboxItem(
@@ -1984,7 +2404,7 @@ class KanbanEngine:
                     from_agent=from_agent,
                     from_repo=from_repo_alias,
                     from_issue=resolved_from,
-                    trusted=True,
+                    trusted=is_trusted,
                     delivered=delivered_fast,
                 ),
             )
@@ -2535,6 +2955,8 @@ class KanbanEngine:
             priority=str(raw.get("priority") or ""),
             milestone=str(raw.get("milestone") or ""),
             target_repo=str(raw.get("target_repo") or ""),
+            cura_build=str(raw.get("cura_build") or ""),
+            firmware_build=str(raw.get("firmware_build") or ""),
             depends_on=[int(x) for x in (raw.get("depends_on") or [])],
             blocks=[int(x) for x in (raw.get("blocks") or [])],
             unmet_deps=[int(x) for x in (raw.get("unmet_deps") or [])],

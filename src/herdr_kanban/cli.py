@@ -17,7 +17,7 @@ from .engine import (
 )
 from .git_ops import GitError
 from .github import GitHubError, gh_binary, has_project_scope
-from .model import COLUMN_TITLES, Column, strip_meta
+from .model import COLUMN_TITLES, Column, short_build_version, strip_meta
 from .tui import BoardTUI
 
 EXIT_OK = 0
@@ -291,6 +291,8 @@ def cmd_sync_labels(args: argparse.Namespace, engine: KanbanEngine) -> int:
         print(f"  [milestone:{ms['status']:<5}] #{ms['number']} {ms['title']}")
     if res["added_priorities"]:
         print(f"  [priority:added]  {', '.join(res['added_priorities'])}")
+    if res.get("added_build_fields"):
+        print(f"  [field:added]     {', '.join(res['added_build_fields'])}")
     return EXIT_OK
 
 
@@ -362,6 +364,20 @@ def cmd_board(args: argparse.Namespace, engine: KanbanEngine) -> int:
             continue
         for t in col_tickets:
             tags: list[str] = []
+            binfo = t.build_info()
+            if col == Column.DONE:
+                if binfo["cura_build"]:
+                    tags.append(f"Cura:{short_build_version(binfo['cura_build'])}")
+                if binfo["firmware_build"]:
+                    tags.append(f"FW:{short_build_version(binfo['firmware_build'])}")
+                if (
+                    not binfo["cura_build"]
+                    and not binfo["firmware_build"]
+                    and not binfo["is_baseline"]
+                    and not binfo["is_release_ticket"]
+                ):
+                    inferred = engine._infer_ticket_trains(t)
+                    tags.append(f"Pending:{'/'.join(inferred)}")
             if t.priority:
                 tags.append(t.priority)
             if t.target_repo and t.target_repo != t.repo_alias:
@@ -408,8 +424,21 @@ def cmd_list(args: argparse.Namespace, engine: KanbanEngine) -> int:
         holder = f"@{t.claim.owner}" if t.claim and t.claim.state in ("active", "review_ready") else "-"
         ref_lbl = t.ref(ctx.is_multi_repo)
         prio_lbl = f"[{t.priority}]" if t.priority else "[-]"
-        wave_lbl = f"deps:{','.join(f'#{d}' for d in t.unmet_deps)}" if t.unmet_deps else f"wave:{t.wave}"
-        print(f"{ref_lbl:<14} [{t.column.value:<11}] {prio_lbl:<6} {wave_lbl:<10} {holder:<16} {t.title}")
+        binfo = t.build_info()
+        build_parts: list[str] = []
+        if binfo["cura_build"]:
+            build_parts.append(f"Cura:{short_build_version(binfo['cura_build'])}")
+        if binfo["firmware_build"]:
+            build_parts.append(f"FW:{short_build_version(binfo['firmware_build'])}")
+        if t.column == Column.DONE and build_parts:
+            wave_lbl = ",".join(build_parts)
+        elif t.column == Column.DONE and binfo["is_baseline"]:
+            wave_lbl = "baseline"
+        elif t.column == Column.DONE and not binfo["is_release_ticket"]:
+            wave_lbl = f"pending:{'/'.join(engine._infer_ticket_trains(t))}"
+        else:
+            wave_lbl = f"deps:{','.join(f'#{d}' for d in t.unmet_deps)}" if t.unmet_deps else f"wave:{t.wave}"
+        print(f"{ref_lbl:<14} [{t.column.value:<11}] {prio_lbl:<6} {wave_lbl:<26} {holder:<16} {t.title}")
     return EXIT_OK
 
 
@@ -436,6 +465,7 @@ def cmd_show(args: argparse.Namespace, engine: KanbanEngine) -> int:
         return _emit_json({"ticket": ticket.to_dict(), "comments": comments})
 
     disp = ticket.ref(ctx.is_multi_repo)
+    binfo = ticket.build_info()
     print(f"{disp} {ticket.title}  [{ticket.column.value}]")
     if ticket.url:
         print(f"URL: {ticket.url}")
@@ -445,6 +475,21 @@ def cmd_show(args: argparse.Namespace, engine: KanbanEngine) -> int:
         print(f"Milestone: {ticket.milestone}")
     if ticket.target_repo:
         print(f"Target repository: {ticket.target_repo}")
+    if binfo["cura_builds"]:
+        print(f"Cura Build: {', '.join(binfo['cura_builds'])}")
+    if binfo["firmware_builds"]:
+        print(f"Firmware Build: {', '.join(binfo['firmware_builds'])}")
+    if (
+        ticket.column == Column.DONE
+        and not binfo["cura_builds"]
+        and not binfo["firmware_builds"]
+        and not binfo["is_baseline"]
+        and not binfo["is_release_ticket"]
+    ):
+        inferred = engine._infer_ticket_trains(ticket)
+        print(f"Build Status: Merged on branch — pending next {'/'.join(inferred)} build")
+    elif binfo["is_baseline"]:
+        print("Build Status: baseline (pre-release train setup)")
     if ticket.labels:
         print(f"Labels: {', '.join(ticket.labels)}")
     if ticket.depends_on:
@@ -803,6 +848,30 @@ def cmd_whats_new(args: argparse.Namespace, engine: KanbanEngine) -> int:
         print()
     else:
         print(digest.get("auto_markdown") or "No landed tickets yet.")
+    return EXIT_OK
+
+
+def cmd_changelog(args: argparse.Namespace, engine: KanbanEngine) -> int:
+    ctx = engine.resolve_context(Path(args.cwd) if args.cwd else None)
+    cached = engine.load_cached_tickets(ctx)
+    if cached is not None and not getattr(args, "refresh", False):
+        _, tickets = cached
+    else:
+        _, tickets = engine.refresh_board(ctx)
+
+    payload = engine.build_release_changelog(
+        ctx,
+        tickets,
+        train=getattr(args, "train", "all") or "all",
+        from_version=getattr(args, "from_version", "") or "",
+        to_version=getattr(args, "to_version", "") or "",
+        search=getattr(args, "search", "") or "",
+        repo=getattr(args, "repo", "") or "",
+        ticket_type=getattr(args, "ticket_type", "") or "",
+    )
+    if getattr(args, "json", False):
+        return _emit_json(payload)
+    print(payload.get("markdown") or "No release builds found.")
     return EXIT_OK
 
 
@@ -1308,6 +1377,54 @@ def build_parser() -> argparse.ArgumentParser:
     p_wn.add_argument("--cwd", help="Repository or umbrella directory")
     p_wn.add_argument("--json", action="store_true", help="Output JSON")
 
+    # changelog
+    p_cl = sub.add_parser(
+        "changelog",
+        help="Show build-to-build changelog and fix availability across Firmware and Cura builds",
+    )
+    p_cl.add_argument(
+        "train",
+        nargs="?",
+        choices=("all", "firmware", "ultimoco", "cura", "slicer"),
+        default="all",
+        help="Filter by release train (`all`, `firmware`/`ultimoco`, or `cura`/`slicer`)",
+    )
+    p_cl.add_argument(
+        "--from",
+        dest="from_version",
+        default="",
+        metavar="VERSION",
+        help="Start build version (e.g. `12.0.0-alpha.12`, `alpha.12`, `5.15.0-alpha.39`, `alpha.39`)",
+    )
+    p_cl.add_argument(
+        "--to",
+        dest="to_version",
+        default="",
+        metavar="VERSION",
+        help="End build version (e.g. `12.0.0-alpha.17`, `alpha.17`, `5.15.0-alpha.45`, `unreleased`)",
+    )
+    p_cl.add_argument(
+        "-s",
+        "--search",
+        default="",
+        help="Search for a specific ticket (#224) or fix keyword (e.g. `seam`, `touchless`, `gyroid`)",
+    )
+    p_cl.add_argument("--repo", default="", help="Filter by target repository alias")
+    p_cl.add_argument(
+        "--type",
+        dest="ticket_type",
+        default="",
+        choices=("", "all", "bug", "feature", "forensics", "doc", "chore", "proof"),
+        help="Filter by ticket type (`bug`, `feature`, `forensics`, etc.)",
+    )
+    p_cl.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Force live GitHub refresh before building changelog",
+    )
+    p_cl.add_argument("--cwd", help="Repository or umbrella directory")
+    p_cl.add_argument("--json", action="store_true", help="Output JSON")
+
 
     # open & tui
     p_open = sub.add_parser(
@@ -1408,6 +1525,7 @@ HANDLERS = {
     "inbox": cmd_inbox,
     "done": cmd_done,
     "whats-new": cmd_whats_new,
+    "changelog": cmd_changelog,
     "open": cmd_open,
     "tui": cmd_tui,
     "install-app-mod": cmd_install_app_mod,
