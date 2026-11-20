@@ -53,6 +53,33 @@
       },
       "additionalProperties": false
     },
+    "releases": {
+      "type": "object",
+      "properties": {
+        "label_prefix": { "type": "string", "default": "release:" },
+        "baseline_label": { "type": "string", "default": "release:baseline" },
+        "trains": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "short_name": { "type": "string" },
+              "display_name": { "type": "string" },
+              "aliases": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+              "label_prefixes": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+              "project_field": { "type": "string" },
+              "color": { "type": "string" },
+              "repos": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+              "domains": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+              "keywords": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
     "columns": {
       "type": "object",
       "properties": {

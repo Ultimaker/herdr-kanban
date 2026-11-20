@@ -2,13 +2,13 @@
 
 ## 0.5.0 (2026-11-20)
 
-- **Firmware & Cura Build Availability Badges on `Done` Cards (`renderCard`, `renderInspector`, `model.py`, `github.py`)**:
-  - Extract `cura_build` (`5.15.0-alpha.N+unimotion`) and `firmware_build` (`12.0.0-alpha.N+unimotion`) from `release:cura-*`, `release:ultimoco-*`, `Released-In:` metadata, `[release]` ticket titles, and GitHub ProjectV2 `Cura Build` / `Firmware Build` fields.
-  - Render a dedicated **Build Availability Badge Row** on every `Done` card in the GPUI board mod (`mods/herdr-kanban/main.js`), TUI, and CLI (`board`, `list`, `show`) so release badges are never truncated by facet label slicing, including `Pending Cura Build` / `Pending FW Build` badges when merged after the latest release.
-  - Provision `Cura Build` and `Firmware Build` TEXT fields on GitHub Projects v2 during `herdr-kanban sync-labels`.
+- **Configurable Release-Train Build Badges on `Done` Cards (`config.py`, `model.py`, `github.py`, `renderCard`, `renderInspector`)**:
+  - Add `[releases]` and `[releases.trains.<id>]` configuration in `.herdr-kanban.toml` (with zero-config auto-discovery fallback for `release:<train>-<semver>` labels and `Released-In:` metadata).
+  - Render a dedicated **Build Availability Badge Row** on every `Done` card in the GPUI board mod (`mods/herdr-kanban/main.js`), TUI, and CLI (`board`, `list`, `show`) so release badges are never truncated by facet label slicing, including pending-build badges when merged after the latest release.
+  - Provision configured `project_field` TEXT fields on GitHub Projects v2 during `herdr-kanban sync-labels`.
 - **Interactive Build-to-Build Changelog & Fix Lookup View & CLI (`renderChangelogView`, `build_release_changelog`, `herdr-kanban changelog`)**:
-  - Add the **`Changelog`** view tab (`Board` | `Changelog` | `What's New`, shortcut `g`) to `mods/herdr-kanban/main.js` with clickable Firmware and Cura `From` → `To` version chips, train/type filters, instant fix lookup banner, and clickable build badges in the Ticket Inspector.
-  - Add `herdr-kanban changelog [all|firmware|cura] [--from <ver>] [--to <ver>] [-s/--search <query>] [--repo <alias>] [--type <type>] [--refresh] [--json]`.
+  - Add the **`Changelog`** view tab (`Board` | `Changelog` | `What's New`, shortcut `g`) to `mods/herdr-kanban/main.js` with clickable per-train `From` → `To` version chips, train/type filters, instant fix lookup banner, and clickable build badges in the Ticket Inspector.
+  - Add `herdr-kanban changelog [train] [--from <ver>] [--to <ver>] [-s/--search <query>] [--repo <alias>] [--type <type>] [--refresh] [--json]`.
 
 ## 0.4.9 (2026-11-19)
 

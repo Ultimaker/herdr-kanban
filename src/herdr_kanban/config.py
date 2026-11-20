@@ -78,6 +78,65 @@ class FacetSpec:
 
 
 @dataclass(slots=True)
+class ReleaseTrainSpec:
+    id: str
+    name: str = ""
+    short_name: str = ""
+    display_name: str = ""
+    aliases: list[str] = field(default_factory=list)
+    label_prefixes: list[str] = field(default_factory=list)
+    project_field: str = ""
+    color: str = ""
+    repos: list[str] = field(default_factory=list)
+    domains: list[str] = field(default_factory=list)
+    keywords: list[str] = field(default_factory=list)
+
+    def effective_name(self) -> str:
+        return self.name or self.id.replace("-", " ").replace("_", " ").title()
+
+    def effective_short_name(self) -> str:
+        return self.short_name or self.effective_name()
+
+    def effective_display_name(self) -> str:
+        return self.display_name or self.effective_name()
+
+    def effective_label_prefixes(self, label_prefix: str = "release:") -> list[str]:
+        if self.label_prefixes:
+            return [p.lower() for p in self.label_prefixes]
+        prefixes = [f"{label_prefix}{self.id}-".lower()]
+        for alias in self.aliases:
+            p = f"{label_prefix}{alias}-".lower()
+            if p not in prefixes:
+                prefixes.append(p)
+        return prefixes
+
+    def matches_token(self, token: str) -> bool:
+        tok = (token or "").strip().lower()
+        if not tok:
+            return False
+        if tok == self.id.lower():
+            return True
+        if tok == self.effective_name().lower() or tok == self.effective_short_name().lower():
+            return True
+        return tok in {a.lower() for a in self.aliases}
+
+    def to_dict(self, label_prefix: str = "release:") -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.effective_name(),
+            "short_name": self.effective_short_name(),
+            "display_name": self.effective_display_name(),
+            "aliases": list(self.aliases),
+            "label_prefixes": self.effective_label_prefixes(label_prefix),
+            "project_field": self.project_field,
+            "color": self.color,
+            "repos": list(self.repos),
+            "domains": list(self.domains),
+            "keywords": list(self.keywords),
+        }
+
+
+@dataclass(slots=True)
 class BoardConfig:
     project_owner: str
     project_number: int
@@ -98,6 +157,9 @@ class BoardConfig:
     require_priority_for_ready: bool = False
     milestones: list[str] = field(default_factory=list)
     facets: dict[str, FacetSpec] = field(default_factory=dict)
+    release_label_prefix: str = "release:"
+    release_baseline_label: str = "release:baseline"
+    release_trains: dict[str, ReleaseTrainSpec] = field(default_factory=dict)
     trusted_authors: list[str] = field(default_factory=list)
     columns: dict[str, str] = field(
         default_factory=lambda: {col.value: title for col, title in COLUMN_TITLES.items()}
@@ -175,6 +237,41 @@ class BoardConfig:
         priorities = [str(p).strip() for p in (board.get("priorities") or []) if str(p).strip()]
         milestones = [str(m).strip() for m in (board.get("milestones") or []) if str(m).strip()]
 
+        release_label_prefix = "release:"
+        release_baseline_label = "release:baseline"
+        trains_map: dict[str, ReleaseTrainSpec] = {}
+        releases_raw = data.get("releases")
+        if isinstance(releases_raw, dict):
+            lp = str(releases_raw.get("label_prefix") or "release:").strip()
+            if lp:
+                release_label_prefix = lp
+            bl = str(releases_raw.get("baseline_label") or f"{release_label_prefix}baseline").strip()
+            if bl:
+                release_baseline_label = bl
+            raw_trains = releases_raw.get("trains")
+            if isinstance(raw_trains, dict):
+                for tid, tentry in raw_trains.items():
+                    if not isinstance(tentry, dict):
+                        continue
+                    train_id = str(tid).strip()
+                    if not train_id:
+                        continue
+                    trains_map[train_id] = ReleaseTrainSpec(
+                        id=train_id,
+                        name=str(tentry.get("name") or "").strip(),
+                        short_name=str(tentry.get("short_name") or "").strip(),
+                        display_name=str(tentry.get("display_name") or "").strip(),
+                        aliases=[str(a).strip() for a in (tentry.get("aliases") or []) if str(a).strip()],
+                        label_prefixes=[
+                            str(p).strip() for p in (tentry.get("label_prefixes") or []) if str(p).strip()
+                        ],
+                        project_field=str(tentry.get("project_field") or "").strip(),
+                        color=str(tentry.get("color") or "").strip(),
+                        repos=[str(r).strip() for r in (tentry.get("repos") or []) if str(r).strip()],
+                        domains=[str(d).strip() for d in (tentry.get("domains") or []) if str(d).strip()],
+                        keywords=[str(k).strip() for k in (tentry.get("keywords") or []) if str(k).strip()],
+                    )
+
         return cls(
             project_owner=project_owner,
             project_number=project_number,
@@ -195,6 +292,9 @@ class BoardConfig:
             require_priority_for_ready=bool(board.get("require_priority_for_ready", False)),
             milestones=milestones,
             facets=facets_map,
+            release_label_prefix=release_label_prefix,
+            release_baseline_label=release_baseline_label,
+            release_trains=trains_map,
             trusted_authors=[str(u).strip() for u in (board.get("trusted_authors") or []) if str(u).strip()],
             columns=cols,
             repos=repos_map,
@@ -411,6 +511,42 @@ def render_board_config_toml(cfg: BoardConfig) -> str:
         if fspec.description:
             lines.append(f"description = {_toml_quote(fspec.description)}")
         lines.append(f"values = [{vals}]")
+
+    if (
+        cfg.release_trains
+        or cfg.release_label_prefix != "release:"
+        or cfg.release_baseline_label != "release:baseline"
+    ):
+        lines.extend(
+            [
+                "",
+                "[releases]",
+                f"label_prefix = {_toml_quote(cfg.release_label_prefix)}",
+                f"baseline_label = {_toml_quote(cfg.release_baseline_label)}",
+            ]
+        )
+        for tid, tspec in cfg.release_trains.items():
+            lines.extend(["", f"[releases.trains.{tid}]"])
+            if tspec.name:
+                lines.append(f"name = {_toml_quote(tspec.name)}")
+            if tspec.short_name:
+                lines.append(f"short_name = {_toml_quote(tspec.short_name)}")
+            if tspec.display_name:
+                lines.append(f"display_name = {_toml_quote(tspec.display_name)}")
+            if tspec.aliases:
+                lines.append(f"aliases = [{', '.join(_toml_quote(a) for a in tspec.aliases)}]")
+            if tspec.label_prefixes:
+                lines.append(f"label_prefixes = [{', '.join(_toml_quote(p) for p in tspec.label_prefixes)}]")
+            if tspec.project_field:
+                lines.append(f"project_field = {_toml_quote(tspec.project_field)}")
+            if tspec.color:
+                lines.append(f"color = {_toml_quote(tspec.color)}")
+            if tspec.repos:
+                lines.append(f"repos = [{', '.join(_toml_quote(r) for r in tspec.repos)}]")
+            if tspec.domains:
+                lines.append(f"domains = [{', '.join(_toml_quote(d) for d in tspec.domains)}]")
+            if tspec.keywords:
+                lines.append(f"keywords = [{', '.join(_toml_quote(k) for k in tspec.keywords)}]")
 
     for alias, entry in cfg.repos.items():
         lines.extend(

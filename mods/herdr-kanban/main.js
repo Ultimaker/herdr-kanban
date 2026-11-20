@@ -341,22 +341,80 @@ function compactAlphaLabel(rawVer) {
   return s;
 }
 
-function resolveTicketBuilds(ticket) {
+function trainAccentColor(trainMeta, idx, t) {
+  const palette = [
+    t.done || t.ansi2 || "#10b981",
+    t.accent || "#4c8bf5",
+    t.ansi5 || "#a855f7",
+    t.working || t.ansi3 || "#d97736",
+  ];
+  const raw = String((trainMeta && trainMeta.color) || "").trim().toLowerCase();
+  if (!raw) return palette[idx % palette.length];
+  if (raw.startsWith("#")) return raw;
+  if (raw === "green" || raw === "done") return t.done || t.ansi2 || "#10b981";
+  if (raw === "cyan" || raw === "blue" || raw === "accent") return t.accent || "#4c8bf5";
+  if (raw === "amber" || raw === "yellow" || raw === "orange") return t.working || t.ansi3 || "#d97736";
+  if (raw === "magenta" || raw === "purple") return t.ansi5 || "#a855f7";
+  if (raw === "red") return t.blocked || t.ansi1 || "#ef4444";
+  return palette[idx % palette.length];
+}
+
+function getTrainMeta(trainId, releaseTrains) {
+  const list = Array.isArray(releaseTrains) ? releaseTrains : [];
+  const low = String(trainId || "").toLowerCase();
+  for (let i = 0; i < list.length; i += 1) {
+    const tr = list[i];
+    if (!tr) continue;
+    const aliases = Array.isArray(tr.aliases) ? tr.aliases.map((a) => String(a).toLowerCase()) : [];
+    if (String(tr.id || "").toLowerCase() === low || aliases.includes(low)) {
+      return { ...tr, _index: i };
+    }
+  }
+  const titleName = String(trainId || "")
+    .replace(/[-_]+/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+  return {
+    id: low || "release",
+    name: titleName || "Release",
+    short_name: titleName || "Rel",
+    display_name: titleName || "Release",
+    color: "",
+    _index: list.length,
+  };
+}
+
+function resolveTicketBuilds(ticket, releaseTrains) {
   if (!ticket) {
     return {
-      curaBuild: "",
-      firmwareBuild: "",
-      curaBuilds: [],
-      firmwareBuilds: [],
+      entries: [],
+      buildsByTrain: {},
       isBaseline: false,
       isReleaseTicket: false,
       unreleasedTrains: [],
     };
   }
-  const curaSet = new Set(Array.isArray(ticket.cura_builds) ? ticket.cura_builds : []);
-  const fwSet = new Set(Array.isArray(ticket.firmware_builds) ? ticket.firmware_builds : []);
-  if (ticket.cura_build) curaSet.add(String(ticket.cura_build).trim());
-  if (ticket.firmware_build) fwSet.add(String(ticket.firmware_build).trim());
+  const trainsList = Array.isArray(releaseTrains) ? releaseTrains : [];
+  const setsByTrain = new Map();
+  const addVer = (tid, ver) => {
+    const v = String(ver || "").trim();
+    if (!v) return;
+    const meta = getTrainMeta(tid, trainsList);
+    if (!setsByTrain.has(meta.id)) setsByTrain.set(meta.id, new Set());
+    setsByTrain.get(meta.id).add(v);
+  };
+
+  if (ticket.builds && typeof ticket.builds === "object") {
+    for (const [tid, vers] of Object.entries(ticket.builds)) {
+      if (Array.isArray(vers)) {
+        for (const v of vers) addVer(tid, v);
+      }
+    }
+  }
+  if (ticket.release_builds && typeof ticket.release_builds === "object") {
+    for (const [tid, ver] of Object.entries(ticket.release_builds)) {
+      addVer(tid, ver);
+    }
+  }
 
   let isBaseline = Boolean(ticket.is_baseline);
   const titleStr = String(ticket.title || "");
@@ -372,68 +430,75 @@ function resolveTicketBuilds(ticket) {
     const low = lbl.toLowerCase();
     if (low === "release:baseline") {
       isBaseline = true;
-    } else if (low.startsWith("release:cura-") || low.startsWith("release:slicer-")) {
-      const v = lbl.slice(lbl.indexOf("-") + 1).trim();
-      if (v) curaSet.add(v);
-    } else if (low.startsWith("release:ultimoco-") || low.startsWith("release:firmware-")) {
-      const v = lbl.slice(lbl.indexOf("-") + 1).trim();
-      if (v) fwSet.add(v);
+      continue;
     }
-  }
-
-  const relInRe = /Released-In:.*?\(\s*(slicer|cura|firmware|ultimoco)\s*:\s*`?([0-9]+\.[0-9]+\.[0-9]+[^\s`)]*)`?\s*\)/gi;
-  let m;
-  while ((m = relInRe.exec(bodyStr)) !== null) {
-    const tr = m[1].toLowerCase();
-    const ver = m[2].trim();
-    if (tr === "slicer" || tr === "cura") curaSet.add(ver);
-    else if (tr === "firmware" || tr === "ultimoco") fwSet.add(ver);
-  }
-
-  if (isReleaseTicket && curaSet.size === 0 && fwSet.size === 0) {
-    const vm = /(\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?(?:\+[A-Za-z0-9.]+)?)/.exec(titleStr);
-    if (vm) {
-      const tLow = titleStr.toLowerCase();
-      if (tLow.includes("cura") || tLow.includes("slicer")) curaSet.add(vm[1]);
-      else if (tLow.includes("ultimoco") || tLow.includes("firmware") || tLow.includes("emb-476")) {
-        fwSet.add(vm[1]);
+    if (low.startsWith("release:")) {
+      let matched = false;
+      for (const tr of trainsList) {
+        const prefs = Array.isArray(tr.label_prefixes) ? tr.label_prefixes : [`release:${tr.id}-`];
+        for (const pref of prefs) {
+          if (low.startsWith(String(pref).toLowerCase())) {
+            addVer(tr.id, lbl.slice(pref.length));
+            matched = true;
+            break;
+          }
+        }
+        if (matched) break;
+      }
+      if (!matched) {
+        const rest = lbl.slice("release:".length);
+        const dashIdx = rest.indexOf("-");
+        if (dashIdx > 0) {
+          const tok = rest.slice(0, dashIdx);
+          const ver = rest.slice(dashIdx + 1).trim();
+          if (/^\d+\.\d+\.\d+/.test(ver)) {
+            addVer(tok, ver);
+          }
+        }
       }
     }
   }
 
-  const curaBuilds = Array.from(curaSet).filter(Boolean);
-  const firmwareBuilds = Array.from(fwSet).filter(Boolean);
-  let unreleasedTrains = Array.isArray(ticket.unreleased_trains)
-    ? [...ticket.unreleased_trains]
-    : [];
-  if (
-    ticket.column === "done" &&
-    curaBuilds.length === 0 &&
-    firmwareBuilds.length === 0 &&
-    !isBaseline &&
-    !isReleaseTicket &&
-    unreleasedTrains.length === 0
-  ) {
-    const lowLabels = rawLabels.map((x) => String(x).toLowerCase());
-    if (lowLabels.includes("domain:slicing") || lowLabels.includes("domain:wire-contract")) {
-      unreleasedTrains.push("cura");
-    }
-    if (
-      lowLabels.includes("domain:rt-control") ||
-      lowLabels.includes("domain:som") ||
-      lowLabels.includes("domain:digital-twin") ||
-      lowLabels.includes("domain:wire-contract")
-    ) {
-      unreleasedTrains.push("firmware");
-    }
-    if (unreleasedTrains.length === 0) unreleasedTrains.push("cura");
+  const relInRe = /Released-In:.*?\(\s*([A-Za-z0-9_-]+)\s*:\s*`?([0-9]+\.[0-9]+\.[0-9]+[^\s`)]*)`?\s*\)/gi;
+  let m;
+  while ((m = relInRe.exec(bodyStr)) !== null) {
+    addVer(m[1], m[2]);
   }
 
+  const orderedIds = [];
+  for (const tr of trainsList) {
+    if (setsByTrain.has(tr.id)) orderedIds.push(tr.id);
+  }
+  for (const tid of setsByTrain.keys()) {
+    if (!orderedIds.includes(tid)) orderedIds.push(tid);
+  }
+
+  const entries = [];
+  const buildsByTrain = {};
+  for (const tid of orderedIds) {
+    const vers = Array.from(setsByTrain.get(tid)).filter(Boolean);
+    if (!vers.length) continue;
+    const meta = getTrainMeta(tid, trainsList);
+    buildsByTrain[tid] = vers[0];
+    entries.push({
+      train: tid,
+      name: meta.name,
+      shortName: meta.short_name,
+      displayName: meta.display_name,
+      color: meta.color,
+      index: meta._index,
+      version: vers[0],
+      versions: vers,
+    });
+  }
+
+  const unreleasedTrains = Array.isArray(ticket.unreleased_trains)
+    ? [...ticket.unreleased_trains]
+    : [];
+
   return {
-    curaBuild: curaBuilds[0] || "",
-    firmwareBuild: firmwareBuilds[0] || "",
-    curaBuilds,
-    firmwareBuilds,
+    entries,
+    buildsByTrain,
     isBaseline,
     isReleaseTicket,
     unreleasedTrains,
@@ -720,12 +785,9 @@ export default class KanbanBoard extends View {
       quickFilter: "active", // "active" | "all" | "p0"
       compactEmpty: true,
       viewMode: "board", // "board" | "changelog" | "whats_new"
-      changelogTrain: "all", // "all" | "firmware" | "cura"
+      changelogTrain: "all", // "all" | <train_id>
       changelogType: "all", // "all" | "bug" | "feature" | "forensics"
-      changelogFwFrom: "",
-      changelogFwTo: "",
-      changelogCuraFrom: "",
-      changelogCuraTo: "",
+      changelogRanges: {}, // { [trainId]: { from: "", to: "" } }
       agentKind: "agy",
       overrideSpaceId: null,
       showDrawer: true,
@@ -770,10 +832,7 @@ export default class KanbanBoard extends View {
     this.viewMode = bus.viewMode || "board";
     this.changelogTrain = bus.changelogTrain || "all";
     this.changelogType = bus.changelogType || "all";
-    this.changelogFwFrom = bus.changelogFwFrom || "";
-    this.changelogFwTo = bus.changelogFwTo || "";
-    this.changelogCuraFrom = bus.changelogCuraFrom || "";
-    this.changelogCuraTo = bus.changelogCuraTo || "";
+    this.changelogRanges = { ...(bus.changelogRanges || {}) };
     this.agentKind = bus.agentKind;
     this.userPickedAgent = false;
 
@@ -926,10 +985,7 @@ export default class KanbanBoard extends View {
       }
       if (patch.changelogTrain !== undefined) v.changelogTrain = patch.changelogTrain;
       if (patch.changelogType !== undefined) v.changelogType = patch.changelogType;
-      if (patch.changelogFwFrom !== undefined) v.changelogFwFrom = patch.changelogFwFrom;
-      if (patch.changelogFwTo !== undefined) v.changelogFwTo = patch.changelogFwTo;
-      if (patch.changelogCuraFrom !== undefined) v.changelogCuraFrom = patch.changelogCuraFrom;
-      if (patch.changelogCuraTo !== undefined) v.changelogCuraTo = patch.changelogCuraTo;
+      if (patch.changelogRanges !== undefined) v.changelogRanges = { ...patch.changelogRanges };
       if (patch.agentKind !== undefined) {
         v.agentKind = patch.agentKind;
         v.userPickedAgent = true;
@@ -1096,8 +1152,8 @@ export default class KanbanBoard extends View {
       const prio = String(t.priority || "").toLowerCase();
       const owner = t.claim && t.claim.owner ? `@${t.claim.owner.toLowerCase()}` : "";
       const labels = Array.isArray(t.labels) ? t.labels.join(" ").toLowerCase() : "";
-      const binfo = resolveTicketBuilds(t);
-      const buildsStr = `${binfo.curaBuild} ${binfo.firmwareBuild}`.toLowerCase();
+      const binfo = resolveTicketBuilds(t, this.board && this.board.release_trains);
+      const buildsStr = binfo.entries.map((e) => `${e.shortName} ${e.version}`).join(" ").toLowerCase();
       return (
         ref.includes(q) ||
         title.includes(q) ||
@@ -2609,7 +2665,7 @@ export default class KanbanBoard extends View {
     const unmetDeps = Array.isArray(ticket.unmet_deps) ? ticket.unmet_deps : [];
     const blocks = Array.isArray(ticket.blocks) ? ticket.blocks : [];
     const rawLabels = Array.isArray(ticket.labels) ? ticket.labels : [];
-    const buildInfo = resolveTicketBuilds(ticket);
+    const buildInfo = resolveTicketBuilds(ticket, this.board && this.board.release_trains);
     const visibleFacets = rawLabels
       .filter(
         (l) =>
@@ -2971,73 +3027,49 @@ export default class KanbanBoard extends View {
       .when(
         Boolean(
           isDoneCol ||
-            buildInfo.curaBuild ||
-            buildInfo.firmwareBuild ||
+            buildInfo.entries.length > 0 ||
             buildInfo.unreleasedTrains.length > 0
         ),
         (d) => {
-          const curaCol = t.done || t.ansi2 || "#10b981";
-          const fwCol = t.accent || "#4c8bf5";
+          const releaseTrains = (this.board && this.board.release_trains) || [];
           const warnCol = t.working || t.ansi3 || "#d97736";
           const buildPills = [];
-          if (buildInfo.curaBuild) {
-            const shortCura = shortBuildVersion(buildInfo.curaBuild);
+          for (const entry of buildInfo.entries) {
+            const bCol = trainAccentColor(entry, entry.index, t);
+            const shortVer = shortBuildVersion(entry.version);
             buildPills.push(
               h_flex()
-                .id(`card-cura-bld-${ticket.number}`)
+                .id(`card-bld-${entry.train}-${ticket.number}`)
                 .flex_none()
                 .items_center()
                 .gap(3)
                 .px(5)
                 .py(1.5)
                 .rounded(4)
-                .bg(withAlpha(curaCol, "1A") || t.background)
+                .bg(withAlpha(bCol, "1A") || t.background)
                 .border_1()
-                .border_color(withAlpha(curaCol, "66") || curaCol)
-                .child(div().size(5).rounded_full().bg(curaCol))
+                .border_color(withAlpha(bCol, "66") || bCol)
+                .child(div().size(5).rounded_full().bg(bCol))
                 .child(
                   div()
                     .text_size(9.5)
                     .font_semibold()
-                    .text_color(curaCol)
-                    .child(`Cura ${shortCura}`)
-                )
-            );
-          }
-          if (buildInfo.firmwareBuild) {
-            const shortFw = shortBuildVersion(buildInfo.firmwareBuild);
-            buildPills.push(
-              h_flex()
-                .id(`card-fw-bld-${ticket.number}`)
-                .flex_none()
-                .items_center()
-                .gap(3)
-                .px(5)
-                .py(1.5)
-                .rounded(4)
-                .bg(withAlpha(fwCol, "1A") || t.background)
-                .border_1()
-                .border_color(withAlpha(fwCol, "66") || fwCol)
-                .child(div().size(5).rounded_full().bg(fwCol))
-                .child(
-                  div()
-                    .text_size(9.5)
-                    .font_semibold()
-                    .text_color(fwCol)
-                    .child(`FW ${shortFw}`)
+                    .text_color(bCol)
+                    .child(`${entry.shortName} ${shortVer}`)
                 )
             );
           }
           if (
             buildPills.length === 0 &&
             isDoneCol &&
+            releaseTrains.length > 0 &&
             !buildInfo.isBaseline &&
             !buildInfo.isReleaseTicket
           ) {
             const trLabel =
               buildInfo.unreleasedTrains.length > 0
                 ? buildInfo.unreleasedTrains
-                    .map((tr) => (tr === "firmware" ? "FW" : "Cura"))
+                    .map((trId) => getTrainMeta(trId, releaseTrains).short_name)
                     .join("+")
                 : "Next";
             buildPills.push(
@@ -3941,13 +3973,18 @@ export default class KanbanBoard extends View {
                                 .overflow_hidden()
                                 .children(
                                   item.releases.slice(0, 3).map((relStr, rIdx) => {
-                                    const isFw = String(relStr).toLowerCase().startsWith("ultimoco");
-                                    const col = isFw ? t.accent : t.done || t.ansi2;
-                                    const cleanRel = shortBuildVersion(
-                                      String(relStr)
-                                        .replace(/^cura-/i, "Cura ")
-                                        .replace(/^ultimoco-/i, "FW ")
-                                    );
+                                    const releaseTrains = (this.board && this.board.release_trains) || [];
+                                    const strVal = String(relStr || "");
+                                    const dashIdx = strVal.indexOf("-");
+                                    const tok = dashIdx > 0 ? strVal.slice(0, dashIdx) : "";
+                                    const ver = dashIdx > 0 ? strVal.slice(dashIdx + 1) : strVal;
+                                    const meta = tok ? getTrainMeta(tok, releaseTrains) : null;
+                                    const col = meta
+                                      ? trainAccentColor(meta, meta._index, t)
+                                      : t.done || t.ansi2;
+                                    const cleanRel = meta
+                                      ? `${meta.short_name} ${shortBuildVersion(ver)}`
+                                      : shortBuildVersion(strVal);
                                     return div()
                                       .id(`wn-rel-${idx}-${rIdx}`)
                                       .flex_none()
@@ -3986,70 +4023,67 @@ export default class KanbanBoard extends View {
   }
 
   jumpToBuildChangelog(train, version, cx) {
-    if (!version) return;
-    if (train === "firmware") {
-      this.syncBus(
-        {
-          viewMode: "changelog",
-          changelogTrain: "firmware",
-          changelogFwFrom: version,
-          changelogFwTo: version,
-        },
-        cx
-      );
-    } else if (train === "cura") {
-      this.syncBus(
-        {
-          viewMode: "changelog",
-          changelogTrain: "cura",
-          changelogCuraFrom: version,
-          changelogCuraTo: version,
-        },
-        cx
-      );
-    }
+    if (!train || !version) return;
+    const nextRanges = {
+      ...(this.changelogRanges || {}),
+      [train]: { from: version, to: version },
+    };
+    this.syncBus(
+      {
+        viewMode: "changelog",
+        changelogTrain: train,
+        changelogRanges: nextRanges,
+      },
+      cx
+    );
   }
 
   toggleVersionRangeChip(train, version, versionList, cx) {
-    const fromKey = train === "firmware" ? "changelogFwFrom" : "changelogCuraFrom";
-    const toKey = train === "firmware" ? "changelogFwTo" : "changelogCuraTo";
-    const curFrom = this[fromKey] || "";
-    const curTo = this[toKey] || "";
+    const prev = (this.changelogRanges && this.changelogRanges[train]) || {};
+    const curFrom = prev.from || "";
+    const curTo = prev.to || "";
+    const setRange = (from, to) => {
+      const nextRanges = { ...(this.changelogRanges || {}), [train]: { from, to } };
+      this.syncBus({ changelogRanges: nextRanges }, cx);
+    };
 
     if (!curFrom && !curTo) {
-      this.syncBus({ [fromKey]: version, [toKey]: version }, cx);
+      setRange(version, version);
       return;
     }
     if (curFrom === version && curTo === version) {
-      this.syncBus({ [fromKey]: "", [toKey]: "" }, cx);
+      setRange("", "");
       return;
     }
     const idxClick = versionList.indexOf(version);
     const idxFrom = curFrom ? versionList.indexOf(curFrom) : 0;
-    const idxTo = curTo ? versionList.indexOf(curTo) : versionList.length - 1;
     if (idxClick < 0) return;
 
     if (curFrom === curTo) {
       const lo = Math.min(idxFrom, idxClick);
       const hi = Math.max(idxFrom, idxClick);
-      this.syncBus({ [fromKey]: versionList[lo], [toKey]: versionList[hi] }, cx);
+      setRange(versionList[lo], versionList[hi]);
     } else {
-      this.syncBus({ [fromKey]: version, [toKey]: version }, cx);
+      setRange(version, version);
     }
   }
 
   renderChangelogView(t) {
     const cl = (this.board && this.board.changelog) || {};
-    const fwVersions = Array.isArray(cl.firmware_versions) ? cl.firmware_versions : [];
-    const curaVersions = Array.isArray(cl.cura_versions) ? cl.cura_versions : [];
+    const trainsList = Array.isArray(cl.trains)
+      ? cl.trains
+      : Array.isArray(this.board && this.board.release_trains)
+        ? this.board.release_trains
+        : [];
+    const trainVersionsMap = (cl.train_versions && typeof cl.train_versions === "object")
+      ? cl.train_versions
+      : {};
     const allBuilds = Array.isArray(cl.builds) ? cl.builds : [];
     const trainFilter = this.changelogTrain || "all";
     const typeFilter = this.changelogType || "all";
+    const ranges = this.changelogRanges || {};
     const q = (this.searchQuery || "").toLowerCase();
     const repoFlt = (this.repoFilter || "").toLowerCase();
-
-    const curaCol = t.done || t.ansi2 || "#10b981";
-    const fwCol = t.accent || "#4c8bf5";
     const warnCol = t.working || t.ansi3 || "#d97736";
 
     const inRange = (ver, verList, rawFrom, rawTo) => {
@@ -4068,16 +4102,9 @@ export default class KanbanBoard extends View {
     const uniqueTicketsMap = new Map();
     for (const bld of allBuilds) {
       if (trainFilter !== "all" && bld.train !== trainFilter) continue;
-      if (
-        bld.train === "firmware" &&
-        !inRange(bld.version, fwVersions, this.changelogFwFrom, this.changelogFwTo)
-      ) {
-        continue;
-      }
-      if (
-        bld.train === "cura" &&
-        !inRange(bld.version, curaVersions, this.changelogCuraFrom, this.changelogCuraTo)
-      ) {
+      const tVers = Array.isArray(trainVersionsMap[bld.train]) ? trainVersionsMap[bld.train] : [];
+      const tRange = ranges[bld.train] || {};
+      if (!inRange(bld.version, tVers, tRange.from || "", tRange.to || "")) {
         continue;
       }
       const rawItems = Array.isArray(bld.tickets) ? bld.tickets : [];
@@ -4087,11 +4114,12 @@ export default class KanbanBoard extends View {
           return false;
         }
         if (!q) return true;
-        const hay = `${it.ref} #${it.number} ${it.title} ${it.target_repo} ${
-          it.cura_build || ""
-        } ${it.firmware_build || ""} ${(it.labels || []).join(" ")} @${
-          it.owner || ""
-        }`.toLowerCase();
+        const bStr = Object.entries(it.release_builds || {})
+          .map(([k, v]) => `${k} ${v}`)
+          .join(" ");
+        const hay = `${it.ref} #${it.number} ${it.title} ${it.target_repo} ${bStr} ${(
+          it.labels || []
+        ).join(" ")} @${it.owner || ""}`.toLowerCase();
         return hay.includes(q);
       });
       if ((q || repoFlt || typeFilter !== "all") && matchedItems.length === 0) {
@@ -4110,13 +4138,9 @@ export default class KanbanBoard extends View {
     const totalBugs = uniqueTickets.filter((x) => x.type === "bug").length;
     const totalFeatures = uniqueTickets.filter((x) => x.type === "feature").length;
     const totalForensics = uniqueTickets.filter((x) => x.type === "forensics").length;
+    const hasAnyRange = Object.values(ranges).some((r) => Boolean(r && (r.from || r.to)));
     const hasCustomRange = Boolean(
-      this.changelogFwFrom ||
-        this.changelogFwTo ||
-        this.changelogCuraFrom ||
-        this.changelogCuraTo ||
-        trainFilter !== "all" ||
-        typeFilter !== "all"
+      hasAnyRange || trainFilter !== "all" || typeFilter !== "all"
     );
 
     const renderVersionSelectorRow = (trainKey, label, versions, rawFrom, rawTo, accentCol) => {
@@ -4269,8 +4293,14 @@ export default class KanbanBoard extends View {
                   .children(
                     [
                       { id: "all", label: "All Trains" },
-                      { id: "firmware", label: `Firmware (${fwVersions.length})` },
-                      { id: "cura", label: `Cura (${curaVersions.length})` },
+                      ...trainsList.map((tr) => {
+                        const vers = Array.isArray(tr.versions)
+                          ? tr.versions
+                          : Array.isArray(trainVersionsMap[tr.id])
+                            ? trainVersionsMap[tr.id]
+                            : [];
+                        return { id: tr.id, label: `${tr.name || tr.id} (${vers.length})` };
+                      }),
                     ].map((tr) => {
                       const active = trainFilter === tr.id;
                       return div()
@@ -4338,10 +4368,7 @@ export default class KanbanBoard extends View {
                         {
                           changelogTrain: "all",
                           changelogType: "all",
-                          changelogFwFrom: "",
-                          changelogFwTo: "",
-                          changelogCuraFrom: "",
-                          changelogCuraTo: "",
+                          changelogRanges: {},
                         },
                         cx
                       ),
@@ -4350,33 +4377,26 @@ export default class KanbanBoard extends View {
               )
           )
       )
-      .when(
-        trainFilter === "all" || trainFilter === "firmware",
-        (el) =>
-          el.child(
-            renderVersionSelectorRow(
-              "firmware",
-              "Firmware (12.0.0)",
-              fwVersions,
-              this.changelogFwFrom,
-              this.changelogFwTo,
-              fwCol
-            )
-          )
-      )
-      .when(
-        trainFilter === "all" || trainFilter === "cura",
-        (el) =>
-          el.child(
-            renderVersionSelectorRow(
-              "cura",
-              "Cura (5.15.0)",
-              curaVersions,
-              this.changelogCuraFrom,
-              this.changelogCuraTo,
-              curaCol
-            )
-          )
+      .children(
+        trainsList
+          .filter((tr) => trainFilter === "all" || trainFilter === tr.id)
+          .map((tr, idx) => {
+            const vers = Array.isArray(tr.versions)
+              ? tr.versions
+              : Array.isArray(trainVersionsMap[tr.id])
+                ? trainVersionsMap[tr.id]
+                : [];
+            const r = ranges[tr.id] || {};
+            return renderVersionSelectorRow(
+              tr.id,
+              tr.name || tr.id,
+              vers,
+              r.from || "",
+              r.to || "",
+              trainAccentColor(tr, idx, t)
+            );
+          })
+          .filter(Boolean)
       )
       .child(
         // Scrollable Build-by-Build Feed
@@ -4443,11 +4463,18 @@ export default class KanbanBoard extends View {
           )
           .children(
             filteredBuilds.map((bld, bIdx) => {
-              const isFw = bld.train === "firmware";
+              const tMeta = getTrainMeta(bld.train, trainsList);
               const isUnrel = Boolean(bld.is_unreleased);
-              const bCol = isUnrel ? warnCol : isFw ? fwCol : curaCol;
+              const bCol = isUnrel
+                ? warnCol
+                : trainAccentColor(
+                    { color: bld.train_color || tMeta.color },
+                    tMeta._index,
+                    t
+                  );
               const rt = bld.release_ticket || null;
               const items = bld.matchedItems || [];
+              const badgeTitle = `${String(bld.train_name || tMeta.name || bld.train).toUpperCase()} BUILD`;
 
               return v_flex()
                 .id(`cl-build-card-${bIdx}`)
@@ -4483,7 +4510,7 @@ export default class KanbanBoard extends View {
                             .text_size(10.5)
                             .font_semibold()
                             .text_color(bCol)
-                            .child(isFw ? "FIRMWARE BUILD" : "CURA BUILD")
+                            .child(badgeTitle)
                         )
                         .child(
                           div()
@@ -4519,7 +4546,7 @@ export default class KanbanBoard extends View {
                               .border_1()
                               .border_color(t.border)
                               .text_size(10)
-                              .text_color(isFw ? curaCol : fwCol)
+                              .text_color(t.accent)
                               .child(
                                 `Companion: ${shortBuildVersion(rt.companion_version)}`
                               )
@@ -4660,35 +4687,22 @@ export default class KanbanBoard extends View {
                               .items_center()
                               .flex_none()
                               .gap(4)
-                              .when(Boolean(it.cura_build), (cb) =>
-                                cb.child(
-                                  div()
+                              .children(
+                                Object.entries(it.release_builds || {}).map(([trId, ver]) => {
+                                  const meta = getTrainMeta(trId, trainsList);
+                                  const col = trainAccentColor(meta, meta._index, t);
+                                  return div()
                                     .px(5)
                                     .py(1)
                                     .rounded(4)
-                                    .bg(withAlpha(curaCol, "18") || t.surface)
+                                    .bg(withAlpha(col, "18") || t.surface)
                                     .border_1()
-                                    .border_color(withAlpha(curaCol, "60") || curaCol)
+                                    .border_color(withAlpha(col, "60") || col)
                                     .text_size(9.5)
                                     .font_semibold()
-                                    .text_color(curaCol)
-                                    .child(`Cura ${shortBuildVersion(it.cura_build)}`)
-                                )
-                              )
-                              .when(Boolean(it.firmware_build), (fb) =>
-                                fb.child(
-                                  div()
-                                    .px(5)
-                                    .py(1)
-                                    .rounded(4)
-                                    .bg(withAlpha(fwCol, "18") || t.surface)
-                                    .border_1()
-                                    .border_color(withAlpha(fwCol, "60") || fwCol)
-                                    .text_size(9.5)
-                                    .font_semibold()
-                                    .text_color(fwCol)
-                                    .child(`FW ${shortBuildVersion(it.firmware_build)}`)
-                                )
+                                    .text_color(col)
+                                    .child(`${meta.short_name} ${shortBuildVersion(ver)}`);
+                                })
                               )
                           );
                       })
@@ -5753,64 +5767,42 @@ export default class KanbanBoard extends View {
                       .when(
                         Boolean(
                           isDoneTicket ||
-                            resolveTicketBuilds(ticket).curaBuild ||
-                            resolveTicketBuilds(ticket).firmwareBuild
+                            resolveTicketBuilds(ticket, this.board && this.board.release_trains)
+                              .entries.length > 0
                         ),
                         (bRow) => {
-                          const bi = resolveTicketBuilds(ticket);
-                          const curaCol = t.done || t.ansi2 || "#10b981";
-                          const fwCol = t.accent || "#4c8bf5";
+                          const releaseTrains = (this.board && this.board.release_trains) || [];
+                          const bi = resolveTicketBuilds(ticket, releaseTrains);
                           const warnCol = t.working || t.ansi3 || "#d97736";
                           return bRow
-                            .when(Boolean(bi.curaBuild), (el) =>
-                              el.child(
-                                div()
-                                  .id("insp-cura-build-pill")
+                            .children(
+                              bi.entries.map((entry) => {
+                                const col = trainAccentColor(entry, entry.index, t);
+                                return div()
+                                  .id(`insp-bld-pill-${entry.train}`)
                                   .flex_none()
                                   .px(6)
                                   .py(1)
                                   .rounded(4)
                                   .cursor_pointer()
-                                  .bg(withAlpha(curaCol, "1C") || t.background)
+                                  .bg(withAlpha(col, "1C") || t.background)
                                   .border_1()
-                                  .border_color(withAlpha(curaCol, "70") || curaCol)
+                                  .border_color(withAlpha(col, "70") || col)
                                   .text_size(10)
                                   .font_semibold()
-                                  .text_color(curaCol)
+                                  .text_color(col)
                                   .hover((s) => s.bg(t.hover))
                                   .on_click((_ev, cx) =>
-                                    this.jumpToBuildChangelog("cura", bi.curaBuild, cx)
+                                    this.jumpToBuildChangelog(entry.train, entry.version, cx)
                                   )
-                                  .child(`Cura Build: ${shortBuildVersion(bi.curaBuild)}`)
-                              )
-                            )
-                            .when(Boolean(bi.firmwareBuild), (el) =>
-                              el.child(
-                                div()
-                                  .id("insp-fw-build-pill")
-                                  .flex_none()
-                                  .px(6)
-                                  .py(1)
-                                  .rounded(4)
-                                  .cursor_pointer()
-                                  .bg(withAlpha(fwCol, "1C") || t.background)
-                                  .border_1()
-                                  .border_color(withAlpha(fwCol, "70") || fwCol)
-                                  .text_size(10)
-                                  .font_semibold()
-                                  .text_color(fwCol)
-                                  .hover((s) => s.bg(t.hover))
-                                  .on_click((_ev, cx) =>
-                                    this.jumpToBuildChangelog("firmware", bi.firmwareBuild, cx)
-                                  )
-                                  .child(`Firmware Build: ${shortBuildVersion(bi.firmwareBuild)}`)
-                              )
+                                  .child(`${entry.name} Build: ${shortBuildVersion(entry.version)}`);
+                              })
                             )
                             .when(
                               Boolean(
                                 isDoneTicket &&
-                                  !bi.curaBuild &&
-                                  !bi.firmwareBuild &&
+                                  bi.entries.length === 0 &&
+                                  releaseTrains.length > 0 &&
                                   !bi.isBaseline &&
                                   !bi.isReleaseTicket
                               ),
@@ -6036,10 +6028,7 @@ export default class KanbanBoard extends View {
       this.viewMode = this.bus.viewMode || "board";
       this.changelogTrain = this.bus.changelogTrain || "all";
       this.changelogType = this.bus.changelogType || "all";
-      this.changelogFwFrom = this.bus.changelogFwFrom || "";
-      this.changelogFwTo = this.bus.changelogFwTo || "";
-      this.changelogCuraFrom = this.bus.changelogCuraFrom || "";
-      this.changelogCuraTo = this.bus.changelogCuraTo || "";
+      this.changelogRanges = { ...(this.bus.changelogRanges || {}) };
       this.agentKind = this.bus.agentKind;
       this.overrideSpaceId = this.bus.overrideSpaceId;
       this.showDrawer = this.bus.showDrawer !== false;

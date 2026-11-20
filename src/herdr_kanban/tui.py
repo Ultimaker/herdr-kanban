@@ -382,16 +382,24 @@ class BoardTUI:
             return [terminal.pad_ansi(line1, width)]
 
         skey = self._state_key(ticket)
-        binfo = ticket.build_info()
+        trains_cfg = self.ctx.board.release_trains if self.ctx else {}
+        binfo = ticket.build_info(
+            trains=trains_cfg,
+            label_prefix=self.ctx.board.release_label_prefix if self.ctx else "release:",
+            baseline_label=self.ctx.board.release_baseline_label if self.ctx else "release:baseline",
+        )
         badges: list[str] = []
         if ticket.column == Column.DONE:
-            if binfo["cura_build"]:
-                badges.append(terminal.green(f"Cura:{short_build_version(binfo['cura_build'])}"))
-            if binfo["firmware_build"]:
-                badges.append(terminal.cyan(f"FW:{short_build_version(binfo['firmware_build'])}"))
+            primary_builds = binfo.get("primary_builds") or {}
+            palette = (terminal.green, terminal.cyan, terminal.magenta, terminal.yellow)
+            for idx, (tid, ver) in enumerate(primary_builds.items()):
+                spec = trains_cfg.get(tid)
+                short_lbl = spec.effective_short_name() if spec else tid.upper()
+                color_fn = palette[idx % len(palette)]
+                badges.append(color_fn(f"{short_lbl}:{short_build_version(ver)}"))
             if (
-                not binfo["cura_build"]
-                and not binfo["firmware_build"]
+                not primary_builds
+                and trains_cfg
                 and not binfo["is_baseline"]
                 and not binfo["is_release_ticket"]
             ):
@@ -468,15 +476,23 @@ class BoardTUI:
         lines = [sep, hdr]
 
         meta_parts: list[str] = []
-        binfo = ticket.build_info()
-        if binfo["cura_build"]:
-            meta_parts.append(f"Cura: {terminal.green(short_build_version(binfo['cura_build']))}")
-        if binfo["firmware_build"]:
-            meta_parts.append(f"FW: {terminal.cyan(short_build_version(binfo['firmware_build']))}")
+        trains_cfg = self.ctx.board.release_trains if self.ctx else {}
+        binfo = ticket.build_info(
+            trains=trains_cfg,
+            label_prefix=self.ctx.board.release_label_prefix if self.ctx else "release:",
+            baseline_label=self.ctx.board.release_baseline_label if self.ctx else "release:baseline",
+        )
+        primary_builds = binfo.get("primary_builds") or {}
+        palette = (terminal.green, terminal.cyan, terminal.magenta, terminal.yellow)
+        for idx, (tid, ver) in enumerate(primary_builds.items()):
+            spec = trains_cfg.get(tid)
+            short_lbl = spec.effective_short_name() if spec else tid.upper()
+            color_fn = palette[idx % len(palette)]
+            meta_parts.append(f"{short_lbl}: {color_fn(short_build_version(ver))}")
         if (
             ticket.column == Column.DONE
-            and not binfo["cura_build"]
-            and not binfo["firmware_build"]
+            and not primary_builds
+            and trains_cfg
             and not binfo["is_baseline"]
             and not binfo["is_release_ticket"]
         ):

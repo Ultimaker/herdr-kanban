@@ -434,6 +434,12 @@ class KanbanEngine:
         extra_kwargs: dict[str, Any] = {}
         if ctx.board.priority_field and ctx.board.priority_field != "Priority":
             extra_kwargs["priority_field"] = ctx.board.priority_field
+        if ctx.board.release_trains:
+            extra_kwargs["release_trains"] = ctx.board.release_trains
+        if ctx.board.release_label_prefix != "release:":
+            extra_kwargs["release_label_prefix"] = ctx.board.release_label_prefix
+        if ctx.board.release_baseline_label != "release:baseline":
+            extra_kwargs["release_baseline_label"] = ctx.board.release_baseline_label
         try:
             if ctx.is_multi_repo:
                 allowed = {
@@ -571,49 +577,27 @@ class KanbanEngine:
         return done, len(boxes)
 
     @staticmethod
-    def _infer_ticket_trains(ticket: Ticket) -> list[str]:
-        """Infer which release train(s) (`cura`, `firmware`) a ticket targets."""
-        slicer_repos = {
-            "cura-unimotion",
-            "curaengine-unimotion",
-            "uranium-unimotion",
-            "curamcp",
-            "curator",
-            "neoprep",
-            "fdm_materials",
-            "fdm_materials_private",
-            "cura-private-data",
-        }
-        firmware_repos = {
-            "ultimoco",
-            "opinicus",
-            "okuda",
-            "misp-service",
-            "print-process-reporting",
-            "marvin-service",
-            "python3-uc-firmware-upgrade",
-            "ultitools",
-            "bench-telemetry",
-            "stardust-printer_console",
-            "misc-product-specific",
-            "jedi-build",
-            "jedi-cookbook",
-        }
+    def _infer_ticket_trains(ctx: RepoContext, ticket: Ticket) -> list[str]:
+        """Infer which configured release train(s) a ticket targets."""
+        trains_cfg = ctx.board.release_trains
+        if not trains_cfg:
+            return []
         labels = {str(x).lower() for x in ticket.labels}
         target_repo = (ticket.target_repo or ticket.repo_alias or ticket.repo_name or "").lower()
-        trains: list[str] = []
-        if target_repo in slicer_repos or "domain:slicing" in labels or "domain:wire-contract" in labels:
-            trains.append("cura")
-        fw_domains = {"domain:rt-control", "domain:som", "domain:digital-twin", "domain:wire-contract"}
-        if target_repo in firmware_repos or bool(labels & fw_domains):
-            trains.append("firmware")
-        if not trains:
-            combined = f"{ticket.title} {ticket.body}".upper()
-            if "CURA-13401" in combined:
-                trains.append("cura")
-            if "EMB-476" in combined:
-                trains.append("firmware")
-        return trains or ["cura"]
+        combined = f"{ticket.title} {ticket.body}".lower()
+        matched: list[str] = []
+        for tid, spec in trains_cfg.items():
+            repo_match = bool(target_repo and target_repo in {r.lower() for r in spec.repos})
+            domain_match = any(
+                (d.lower() if ":" in d else f"domain:{d.lower()}") in labels for d in spec.domains
+            )
+            if repo_match or domain_match:
+                matched.append(tid)
+        if not matched:
+            for tid, spec in trains_cfg.items():
+                if any(kw.lower() in combined for kw in spec.keywords if kw):
+                    matched.append(tid)
+        return matched or [next(iter(trains_cfg))]
 
     def serialize_ticket_for_board(
         self,
@@ -621,7 +605,12 @@ class KanbanEngine:
         ticket: Ticket,
         local_by_key: dict[tuple[str, int], state.LocalClaim] | None = None,
     ) -> dict[str, Any]:
-        row = ticket.to_dict()
+        trains_cfg = ctx.board.release_trains
+        row = ticket.to_dict(
+            trains=trains_cfg,
+            label_prefix=ctx.board.release_label_prefix,
+            baseline_label=ctx.board.release_baseline_label,
+        )
         row["ref"] = ticket.ref(ctx.is_multi_repo)
         row["cli_ref"] = (
             f"{ticket.repo_alias}#{ticket.number}"
@@ -640,12 +629,12 @@ class KanbanEngine:
         row["checklist_total"] = total_cnt
         if (
             ticket.column == Column.DONE
-            and not row.get("cura_build")
-            and not row.get("firmware_build")
+            and not row.get("release_builds")
+            and trains_cfg
             and not row.get("is_baseline")
             and not row.get("is_release_ticket")
         ):
-            row["unreleased_trains"] = self._infer_ticket_trains(ticket)
+            row["unreleased_trains"] = self._infer_ticket_trains(ctx, ticket)
         else:
             row["unreleased_trains"] = []
         return row
@@ -703,6 +692,10 @@ class KanbanEngine:
             "priorities": list(ctx.board.priorities),
             "milestones": list(ctx.board.milestones),
             "facets": facets_dict,
+            "release_trains": [
+                spec.to_dict(ctx.board.release_label_prefix)
+                for spec in ctx.board.release_trains.values()
+            ],
             "columns": [{"id": col.value, "title": COLUMN_TITLES[col]} for col in Column],
             "settings": {
                 "default_agent_kind": ctx.settings.default_agent_kind,
@@ -1190,7 +1183,7 @@ class KanbanEngine:
 
     @staticmethod
     def _match_version_index(versions: list[str], query: str) -> int | None:
-        """Resolve a version query (`alpha.12`, `12`, `12.0.0-alpha.12`, `unreleased`) to an index."""
+        """Resolve a version query (`alpha.4`, `4`, `2.1.0-alpha.4`, `unreleased`) to an index."""
         q = (query or "").strip().lower().lstrip("v")
         if not q:
             return None
@@ -1224,19 +1217,21 @@ class KanbanEngine:
         repo: str = "",
         ticket_type: str = "",
     ) -> dict[str, Any]:
-        """Build structured changelog across Firmware (`ultimoco`) and Cura (`slicer`) builds."""
-        norm_train = (train or "all").strip().lower()
-        if norm_train in ("slicer", "cura-unimotion"):
-            norm_train = "cura"
-        elif norm_train in ("ultimoco", "fw"):
-            norm_train = "firmware"
+        """Build structured changelog across configured or discovered release trains."""
+        trains_cfg = ctx.board.release_trains
+        raw_train = (train or "all").strip().lower()
+        norm_train = raw_train
+        if raw_train != "all":
+            for tid, spec in trains_cfg.items():
+                if spec.matches_token(raw_train):
+                    norm_train = tid
+                    break
 
         done_tickets = [t for t in tickets if t.column == Column.DONE]
 
         release_ticket_by_key: dict[tuple[str, str], dict[str, Any]] = {}
         tickets_by_build: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        fw_versions_set: set[str] = set()
-        cura_versions_set: set[str] = set()
+        versions_by_train: dict[str, set[str]] = {tid: set() for tid in trains_cfg}
 
         companion_re = re.compile(
             r"Companion Release Ticket\*\*:\s*`?((?:[A-Za-z0-9_.-]+)?#\d+)`?\s*(?:\(`?([^`)\s]+)`?\))?",
@@ -1245,7 +1240,13 @@ class KanbanEngine:
         released_at_re = re.compile(r"Released\s*&\s*Deployed\s*\(([^)]+)\)", re.IGNORECASE)
 
         for t in done_tickets:
-            binfo = t.build_info()
+            binfo = t.build_info(
+                trains=trains_cfg,
+                label_prefix=ctx.board.release_label_prefix,
+                baseline_label=ctx.board.release_baseline_label,
+            )
+            builds_map: dict[str, list[str]] = binfo["builds"]
+            primary_map: dict[str, str] = binfo["primary_builds"]
             ref_str = t.ref(ctx.is_multi_repo)
             cli_ref = (
                 f"{t.repo_alias}#{t.number}"
@@ -1267,12 +1268,10 @@ class KanbanEngine:
                     "companion_ref": comp_m.group(1).strip() if comp_m else "",
                     "companion_version": (comp_m.group(2) or "").strip() if comp_m else "",
                 }
-                for ver in binfo["firmware_builds"]:
-                    fw_versions_set.add(ver)
-                    release_ticket_by_key[("firmware", ver)] = rt_meta
-                for ver in binfo["cura_builds"]:
-                    cura_versions_set.add(ver)
-                    release_ticket_by_key[("cura", ver)] = rt_meta
+                for tid, vers in builds_map.items():
+                    for ver in vers:
+                        versions_by_train.setdefault(tid, set()).add(ver)
+                        release_ticket_by_key[(tid, ver)] = rt_meta
                 continue
 
             clean_title, jira_keys, scopes = self._split_ticket_prefixes(t.title)
@@ -1308,38 +1307,57 @@ class KanbanEngine:
                 "updated_at": t.updated_at,
                 "summary_note": self._extract_ticket_summary_note(t),
                 "labels": list(t.labels),
-                "cura_build": binfo["cura_build"],
-                "firmware_build": binfo["firmware_build"],
-                "cura_builds": binfo["cura_builds"],
-                "firmware_builds": binfo["firmware_builds"],
+                "builds": builds_map,
+                "release_builds": primary_map,
                 "is_baseline": binfo["is_baseline"],
                 "unreleased_trains": [],
             }
 
-            if binfo["firmware_builds"] or binfo["cura_builds"]:
-                for ver in binfo["firmware_builds"]:
-                    fw_versions_set.add(ver)
-                    tickets_by_build.setdefault(("firmware", ver), []).append(item)
-                for ver in binfo["cura_builds"]:
-                    cura_versions_set.add(ver)
-                    tickets_by_build.setdefault(("cura", ver), []).append(item)
-            elif not binfo["is_baseline"]:
-                inferred = self._infer_ticket_trains(t)
+            if builds_map:
+                for tid, vers in builds_map.items():
+                    for ver in vers:
+                        versions_by_train.setdefault(tid, set()).add(ver)
+                        tickets_by_build.setdefault((tid, ver), []).append(item)
+            elif trains_cfg and not binfo["is_baseline"]:
+                inferred = self._infer_ticket_trains(ctx, t)
                 item["unreleased_trains"] = inferred
                 for tr_name in inferred:
+                    versions_by_train.setdefault(tr_name, set())
                     tickets_by_build.setdefault((tr_name, "unreleased"), []).append(item)
 
-        fw_versions = sorted(fw_versions_set, key=parse_semver_sort_key)
-        cura_versions = sorted(cura_versions_set, key=parse_semver_sort_key)
-        if ("firmware", "unreleased") in tickets_by_build:
-            fw_versions.append("unreleased")
-        if ("cura", "unreleased") in tickets_by_build:
-            cura_versions.append("unreleased")
+        ordered_train_ids: list[str] = list(trains_cfg.keys())
+        for tid in sorted(versions_by_train):
+            if tid not in ordered_train_ids:
+                ordered_train_ids.append(tid)
+
+        def _train_meta(tid: str) -> dict[str, Any]:
+            spec = trains_cfg.get(tid)
+            if spec is not None:
+                return spec.to_dict(ctx.board.release_label_prefix)
+            title_name = tid.replace("-", " ").replace("_", " ").title()
+            return {
+                "id": tid,
+                "name": title_name,
+                "short_name": title_name,
+                "display_name": title_name,
+                "aliases": [],
+                "label_prefixes": [f"{ctx.board.release_label_prefix}{tid}-".lower()],
+                "project_field": "",
+                "color": "",
+                "repos": [],
+                "domains": [],
+                "keywords": [],
+            }
+
+        sorted_versions_by_train: dict[str, list[str]] = {}
+        for tid in ordered_train_ids:
+            vers = sorted(versions_by_train.get(tid, set()), key=parse_semver_sort_key)
+            if (tid, "unreleased") in tickets_by_build:
+                vers.append("unreleased")
+            sorted_versions_by_train[tid] = vers
 
         def _filter_version_slice(ver_list: list[str], is_target_train: bool) -> list[str]:
-            if not ver_list:
-                return []
-            if not is_target_train:
+            if not ver_list or not is_target_train:
                 return []
             lo = 0
             hi = len(ver_list) - 1
@@ -1355,10 +1373,13 @@ class KanbanEngine:
                 lo, hi = hi, lo
             return ver_list[lo : hi + 1]
 
-        include_fw = norm_train in ("all", "firmware")
-        include_cura = norm_train in ("all", "cura")
-        selected_fw_versions = _filter_version_slice(fw_versions, include_fw)
-        selected_cura_versions = _filter_version_slice(cura_versions, include_cura)
+        selected_versions_by_train: dict[str, list[str]] = {
+            tid: _filter_version_slice(
+                sorted_versions_by_train[tid],
+                norm_train in ("all", tid),
+            )
+            for tid in ordered_train_ids
+        }
 
         q_lc = (search or "").strip().lower()
         repo_lc = (repo or "").strip().lower()
@@ -1371,14 +1392,16 @@ class KanbanEngine:
                 return False
             if not q_lc:
                 return True
+            builds_str = " ".join(
+                f"{k} {v}" for k, v in (it.get("release_builds") or {}).items()
+            )
             haystack = " ".join(
                 [
                     it["ref"],
                     str(it["number"]),
                     it["title"],
                     it["target_repo"],
-                    it["cura_build"],
-                    it["firmware_build"],
+                    builds_str,
                     " ".join(it["labels"]),
                     it["owner"],
                 ]
@@ -1386,27 +1409,20 @@ class KanbanEngine:
             return q_lc in haystack
 
         builds_out: list[dict[str, Any]] = []
-        for tr_name, ver_list in (
-            ("firmware", list(reversed(selected_fw_versions))),
-            ("cura", list(reversed(selected_cura_versions))),
-        ):
-            for ver in ver_list:
-                full_list = fw_versions if tr_name == "firmware" else cura_versions
+        for tid in ordered_train_ids:
+            meta = _train_meta(tid)
+            full_list = sorted_versions_by_train[tid]
+            for ver in reversed(selected_versions_by_train[tid]):
                 ver_idx = full_list.index(ver)
                 prev_ver = full_list[ver_idx - 1] if ver_idx > 0 else "baseline"
                 raw_items = sorted(
-                    tickets_by_build.get((tr_name, ver), []),
+                    tickets_by_build.get((tid, ver), []),
                     key=lambda x: (self.priority_rank(ctx, x.get("priority", "")), x["number"]),
                 )
                 filtered_items = [it for it in raw_items if _item_matches(it)]
                 if (q_lc or repo_lc or (type_lc and type_lc != "all")) and not filtered_items:
                     continue
-                rt_info = release_ticket_by_key.get((tr_name, ver))
-                disp_name = (
-                    "Ultimoco C++23 Firmware"
-                    if tr_name == "firmware"
-                    else "Cura-unimotion Slicer"
-                )
+                rt_info = release_ticket_by_key.get((tid, ver))
                 short_ver = (
                     "Unreleased (Pending Next Build)"
                     if ver == "unreleased"
@@ -1421,8 +1437,11 @@ class KanbanEngine:
                 other_cnt = len(filtered_items) - bugs_cnt - feat_cnt - for_cnt
                 builds_out.append(
                     {
-                        "train": tr_name,
-                        "train_display": disp_name,
+                        "train": tid,
+                        "train_name": meta["name"],
+                        "train_short_name": meta["short_name"],
+                        "train_display": meta["display_name"],
+                        "train_color": meta["color"],
                         "version": ver,
                         "short_version": short_ver,
                         "previous_version": prev_ver,
@@ -1456,33 +1475,40 @@ class KanbanEngine:
             for it in b["tickets"]:
                 unique_tickets[it["number"]] = it
 
-        rel_fw = [v for v in fw_versions if v != "unreleased"]
-        rel_cura = [v for v in cura_versions if v != "unreleased"]
-        fw_span = (
-            f" (`{short_build_version(rel_fw[0])}` → `{short_build_version(rel_fw[-1])}`)"
-            if rel_fw
-            else ""
-        )
-        cura_span = (
-            f" (`{short_build_version(rel_cura[0])}` → `{short_build_version(rel_cura[-1])}`)"
-            if rel_cura
-            else ""
-        )
-
+        trains_out: list[dict[str, Any]] = []
         md_lines: list[str] = [
             f"# Release & Build Changelog — {ctx.display_name}",
             "",
-            f"- **Firmware Builds (`Ultimoco C++23`)**: `{len(rel_fw)}` releases{fw_span}",
-            (
-                "- **Cura Builds (`Cura-unimotion` + `CuraEngine-unimotion`)**: "
-                f"`{len(rel_cura)}` releases{cura_span}"
-            ),
-            (
-                "- **Matched Tickets in Selection**: "
-                f"`{len(unique_tickets)}` ticket(s) across `{len(builds_out)}` build(s)"
-            ),
-            "",
         ]
+        for tid in ordered_train_ids:
+            meta = _train_meta(tid)
+            all_vers = sorted_versions_by_train[tid]
+            rel_vers = [v for v in all_vers if v != "unreleased"]
+            span = (
+                f" (`{short_build_version(rel_vers[0])}` → `{short_build_version(rel_vers[-1])}`)"
+                if rel_vers
+                else ""
+            )
+            trains_out.append(
+                {
+                    **meta,
+                    "versions": all_vers,
+                    "selected_versions": selected_versions_by_train[tid],
+                }
+            )
+            md_lines.append(
+                f"- **{meta['display_name']} (`{tid}`)**: `{len(rel_vers)}` releases{span}"
+            )
+
+        md_lines.extend(
+            [
+                (
+                    "- **Matched Tickets in Selection**: "
+                    f"`{len(unique_tickets)}` ticket(s) across `{len(builds_out)}` build(s)"
+                ),
+                "",
+            ]
+        )
         for b in builds_out:
             rt = b.get("release_ticket")
             rt_suffix = f" ({rt['ref']})" if rt else ""
@@ -1503,10 +1529,11 @@ class KanbanEngine:
             else:
                 for it in b["tickets"]:
                     build_tags: list[str] = []
-                    if it.get("cura_build"):
-                        build_tags.append(f"Cura: `{short_build_version(it['cura_build'])}`")
-                    if it.get("firmware_build"):
-                        build_tags.append(f"FW: `{short_build_version(it['firmware_build'])}`")
+                    for bt_id, bt_ver in (it.get("release_builds") or {}).items():
+                        bt_meta = _train_meta(bt_id)
+                        build_tags.append(
+                            f"{bt_meta['short_name']}: `{short_build_version(bt_ver)}`"
+                        )
                     if not build_tags and it.get("unreleased_trains"):
                         build_tags.append(f"Pending next {'/'.join(it['unreleased_trains'])} build")
                     btag_str = f" [{', '.join(build_tags)}]" if build_tags else ""
@@ -1523,10 +1550,9 @@ class KanbanEngine:
             "to_version": to_version,
             "search": search,
             "repo": repo,
-            "firmware_versions": fw_versions,
-            "cura_versions": cura_versions,
-            "selected_firmware_versions": selected_fw_versions,
-            "selected_cura_versions": selected_cura_versions,
+            "trains": trains_out,
+            "train_versions": sorted_versions_by_train,
+            "selected_train_versions": selected_versions_by_train,
             "total_unique_tickets": len(unique_tickets),
             "builds": builds_out,
             "markdown": "\n".join(md_lines).strip() + "\n",
@@ -1576,14 +1602,11 @@ class KanbanEngine:
 
         build_fields: list[str] = []
         if schema.project_id:
-            if not schema.cura_build_field_id:
-                fid = self.github.ensure_text_field(schema.project_id, "Cura Build")
-                if fid:
-                    build_fields.append("Cura Build")
-            if not schema.firmware_build_field_id:
-                fid = self.github.ensure_text_field(schema.project_id, "Firmware Build")
-                if fid:
-                    build_fields.append("Firmware Build")
+            for spec in ctx.board.release_trains.values():
+                if spec.project_field and spec.project_field.lower() not in schema.text_fields_by_name:
+                    fid = self.github.ensure_text_field(schema.project_id, spec.project_field)
+                    if fid:
+                        build_fields.append(spec.project_field)
 
         return {
             "issues_repo": f"{issues_entry.owner}/{issues_entry.repo}",
@@ -2955,8 +2978,11 @@ class KanbanEngine:
             priority=str(raw.get("priority") or ""),
             milestone=str(raw.get("milestone") or ""),
             target_repo=str(raw.get("target_repo") or ""),
-            cura_build=str(raw.get("cura_build") or ""),
-            firmware_build=str(raw.get("firmware_build") or ""),
+            release_builds={
+                str(k): str(v)
+                for k, v in (raw.get("release_builds") or {}).items()
+                if str(k) and str(v)
+            },
             depends_on=[int(x) for x in (raw.get("depends_on") or [])],
             blocks=[int(x) for x in (raw.get("blocks") or [])],
             unmet_deps=[int(x) for x in (raw.get("unmet_deps") or [])],

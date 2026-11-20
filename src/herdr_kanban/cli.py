@@ -364,20 +364,27 @@ def cmd_board(args: argparse.Namespace, engine: KanbanEngine) -> int:
             continue
         for t in col_tickets:
             tags: list[str] = []
-            binfo = t.build_info()
+            trains_cfg = ctx.board.release_trains
+            binfo = t.build_info(
+                trains=trains_cfg,
+                label_prefix=ctx.board.release_label_prefix,
+                baseline_label=ctx.board.release_baseline_label,
+            )
             if col == Column.DONE:
-                if binfo["cura_build"]:
-                    tags.append(f"Cura:{short_build_version(binfo['cura_build'])}")
-                if binfo["firmware_build"]:
-                    tags.append(f"FW:{short_build_version(binfo['firmware_build'])}")
+                primary_builds = binfo.get("primary_builds") or {}
+                for tid, ver in primary_builds.items():
+                    spec = trains_cfg.get(tid)
+                    short_lbl = spec.effective_short_name() if spec else tid.upper()
+                    tags.append(f"{short_lbl}:{short_build_version(ver)}")
                 if (
-                    not binfo["cura_build"]
-                    and not binfo["firmware_build"]
+                    not primary_builds
+                    and trains_cfg
                     and not binfo["is_baseline"]
                     and not binfo["is_release_ticket"]
                 ):
-                    inferred = engine._infer_ticket_trains(t)
-                    tags.append(f"Pending:{'/'.join(inferred)}")
+                    inferred = engine._infer_ticket_trains(ctx, t)
+                    if inferred:
+                        tags.append(f"Pending:{'/'.join(inferred)}")
             if t.priority:
                 tags.append(t.priority)
             if t.target_repo and t.target_repo != t.repo_alias:
@@ -424,18 +431,25 @@ def cmd_list(args: argparse.Namespace, engine: KanbanEngine) -> int:
         holder = f"@{t.claim.owner}" if t.claim and t.claim.state in ("active", "review_ready") else "-"
         ref_lbl = t.ref(ctx.is_multi_repo)
         prio_lbl = f"[{t.priority}]" if t.priority else "[-]"
-        binfo = t.build_info()
+        trains_cfg = ctx.board.release_trains
+        binfo = t.build_info(
+            trains=trains_cfg,
+            label_prefix=ctx.board.release_label_prefix,
+            baseline_label=ctx.board.release_baseline_label,
+        )
+        primary_builds = binfo.get("primary_builds") or {}
         build_parts: list[str] = []
-        if binfo["cura_build"]:
-            build_parts.append(f"Cura:{short_build_version(binfo['cura_build'])}")
-        if binfo["firmware_build"]:
-            build_parts.append(f"FW:{short_build_version(binfo['firmware_build'])}")
+        for tid, ver in primary_builds.items():
+            spec = trains_cfg.get(tid)
+            short_lbl = spec.effective_short_name() if spec else tid.upper()
+            build_parts.append(f"{short_lbl}:{short_build_version(ver)}")
         if t.column == Column.DONE and build_parts:
             wave_lbl = ",".join(build_parts)
         elif t.column == Column.DONE and binfo["is_baseline"]:
             wave_lbl = "baseline"
-        elif t.column == Column.DONE and not binfo["is_release_ticket"]:
-            wave_lbl = f"pending:{'/'.join(engine._infer_ticket_trains(t))}"
+        elif t.column == Column.DONE and trains_cfg and not binfo["is_release_ticket"]:
+            inferred = engine._infer_ticket_trains(ctx, t)
+            wave_lbl = f"pending:{'/'.join(inferred)}" if inferred else f"wave:{t.wave}"
         else:
             wave_lbl = f"deps:{','.join(f'#{d}' for d in t.unmet_deps)}" if t.unmet_deps else f"wave:{t.wave}"
         print(f"{ref_lbl:<14} [{t.column.value:<11}] {prio_lbl:<6} {wave_lbl:<26} {holder:<16} {t.title}")
@@ -465,7 +479,12 @@ def cmd_show(args: argparse.Namespace, engine: KanbanEngine) -> int:
         return _emit_json({"ticket": ticket.to_dict(), "comments": comments})
 
     disp = ticket.ref(ctx.is_multi_repo)
-    binfo = ticket.build_info()
+    trains_cfg = ctx.board.release_trains
+    binfo = ticket.build_info(
+        trains=trains_cfg,
+        label_prefix=ctx.board.release_label_prefix,
+        baseline_label=ctx.board.release_baseline_label,
+    )
     print(f"{disp} {ticket.title}  [{ticket.column.value}]")
     if ticket.url:
         print(f"URL: {ticket.url}")
@@ -475,19 +494,22 @@ def cmd_show(args: argparse.Namespace, engine: KanbanEngine) -> int:
         print(f"Milestone: {ticket.milestone}")
     if ticket.target_repo:
         print(f"Target repository: {ticket.target_repo}")
-    if binfo["cura_builds"]:
-        print(f"Cura Build: {', '.join(binfo['cura_builds'])}")
-    if binfo["firmware_builds"]:
-        print(f"Firmware Build: {', '.join(binfo['firmware_builds'])}")
+    builds_map = binfo.get("builds") or {}
+    for tid, vers in builds_map.items():
+        if vers:
+            spec = trains_cfg.get(tid)
+            lbl = spec.effective_name() if spec else tid.title()
+            print(f"{lbl} Build: {', '.join(vers)}")
     if (
         ticket.column == Column.DONE
-        and not binfo["cura_builds"]
-        and not binfo["firmware_builds"]
+        and not builds_map
+        and trains_cfg
         and not binfo["is_baseline"]
         and not binfo["is_release_ticket"]
     ):
-        inferred = engine._infer_ticket_trains(ticket)
-        print(f"Build Status: Merged on branch — pending next {'/'.join(inferred)} build")
+        inferred = engine._infer_ticket_trains(ctx, ticket)
+        if inferred:
+            print(f"Build Status: Merged on branch — pending next {'/'.join(inferred)} build")
     elif binfo["is_baseline"]:
         print("Build Status: baseline (pre-release train setup)")
     if ticket.labels:
@@ -1380,34 +1402,33 @@ def build_parser() -> argparse.ArgumentParser:
     # changelog
     p_cl = sub.add_parser(
         "changelog",
-        help="Show build-to-build changelog and fix availability across Firmware and Cura builds",
+        help="Show build-to-build changelog and fix availability across configured release trains",
     )
     p_cl.add_argument(
         "train",
         nargs="?",
-        choices=("all", "firmware", "ultimoco", "cura", "slicer"),
         default="all",
-        help="Filter by release train (`all`, `firmware`/`ultimoco`, or `cura`/`slicer`)",
+        help="Filter by release train ID or alias (default: `all`)",
     )
     p_cl.add_argument(
         "--from",
         dest="from_version",
         default="",
         metavar="VERSION",
-        help="Start build version (e.g. `12.0.0-alpha.12`, `alpha.12`, `5.15.0-alpha.39`, `alpha.39`)",
+        help="Start build version (e.g. `1.2.0-alpha.3`, `alpha.3`, `2.0.0`)",
     )
     p_cl.add_argument(
         "--to",
         dest="to_version",
         default="",
         metavar="VERSION",
-        help="End build version (e.g. `12.0.0-alpha.17`, `alpha.17`, `5.15.0-alpha.45`, `unreleased`)",
+        help="End build version (e.g. `1.2.0-alpha.8`, `alpha.8`, `unreleased`)",
     )
     p_cl.add_argument(
         "-s",
         "--search",
         default="",
-        help="Search for a specific ticket (#224) or fix keyword (e.g. `seam`, `touchless`, `gyroid`)",
+        help="Search for a specific ticket (#42) or fix keyword (e.g. `auth`, `parser`)",
     )
     p_cl.add_argument("--repo", default="", help="Filter by target repository alias")
     p_cl.add_argument(

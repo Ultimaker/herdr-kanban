@@ -406,7 +406,7 @@ class FileOverlap:
 
 
 _RELEASED_IN_RE = re.compile(
-    r"Released-In:.*?\(\s*(slicer|cura|firmware|ultimoco)\s*:\s*`?([0-9]+\.[0-9]+\.[0-9]+[^\s`)]*)`?\s*\)",
+    r"Released-In:.*?\(\s*([A-Za-z0-9_-]+)\s*:\s*`?([0-9]+\.[0-9]+\.[0-9]+[^\s`)]*)`?\s*\)",
     re.IGNORECASE,
 )
 _SEMVER_TOKEN_RE = re.compile(r"(\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?(?:\+[A-Za-z0-9.]+)?)")
@@ -428,27 +428,92 @@ def parse_semver_sort_key(version_str: str) -> tuple[int, int, int, int, str]:
 
 
 def short_build_version(version_str: str) -> str:
-    """Return compact human-readable version without `+unimotion` build metadata suffix."""
+    """Return compact human-readable SemVer without `+build` metadata suffix."""
     raw = (version_str or "").strip()
     if not raw:
         return ""
     return re.sub(r"\+[A-Za-z0-9._-]+$", "", raw)
 
 
+def _normalize_trains_map(trains: dict[str, Any] | list[Any] | None) -> dict[str, Any]:
+    if not trains:
+        return {}
+    if isinstance(trains, dict):
+        return trains
+    return {getattr(t, "id", str(t)): t for t in trains}
+
+
+def _resolve_train_token(token: str, trains_map: dict[str, Any]) -> str:
+    tok = (token or "").strip().lower()
+    if not tok:
+        return ""
+    for tid, spec in trains_map.items():
+        if hasattr(spec, "matches_token") and spec.matches_token(tok):
+            return tid
+        if isinstance(spec, dict):
+            aliases = [str(a).lower() for a in (spec.get("aliases") or [])]
+            candidates = (
+                tid.lower(),
+                str(spec.get("name") or "").lower(),
+                str(spec.get("short_name") or "").lower(),
+                *aliases,
+            )
+            if tok in candidates:
+                return tid
+        elif tok == tid.lower():
+            return tid
+    return tok
+
+
+def _train_label_prefixes(tid: str, spec: Any, label_prefix: str) -> list[str]:
+    if hasattr(spec, "effective_label_prefixes"):
+        return list(spec.effective_label_prefixes(label_prefix))
+    if isinstance(spec, dict):
+        if spec.get("label_prefixes"):
+            return [str(p).lower() for p in spec["label_prefixes"]]
+        prefixes = [f"{label_prefix}{tid}-".lower()]
+        for alias in spec.get("aliases") or []:
+            p = f"{label_prefix}{alias}-".lower()
+            if p not in prefixes:
+                prefixes.append(p)
+        return prefixes
+    return [f"{label_prefix}{tid}-".lower()]
+
+
+def _train_keywords(tid: str, spec: Any) -> list[str]:
+    kws = [tid.lower()]
+    if hasattr(spec, "keywords"):
+        kws.extend(k.lower() for k in spec.keywords)
+        kws.extend(a.lower() for a in spec.aliases)
+        if spec.name:
+            kws.append(spec.name.lower())
+    elif isinstance(spec, dict):
+        kws.extend(str(k).lower() for k in (spec.get("keywords") or []))
+        kws.extend(str(a).lower() for a in (spec.get("aliases") or []))
+        if spec.get("name"):
+            kws.append(str(spec["name"]).lower())
+    return [k for k in kws if k]
+
+
 def extract_ticket_builds(
     labels: list[str] | None,
     body: str | None = "",
     title: str | None = "",
-    cura_field: str = "",
-    firmware_field: str = "",
+    *,
+    project_fields: dict[str, str] | None = None,
+    trains: dict[str, Any] | list[Any] | None = None,
+    label_prefix: str = "release:",
+    baseline_label: str = "release:baseline",
 ) -> dict[str, Any]:
-    """Extract Firmware and Cura build versions from labels, body, title, and Project fields."""
+    """Extract release-train build versions from labels, body, title, and Project fields."""
     lbl_list = [str(x).strip() for x in (labels or []) if str(x).strip()]
     body_text = str(body or "")
     title_text = str(title or "")
+    trains_map = _normalize_trains_map(trains)
+    lp_low = (label_prefix or "release:").lower()
+    bl_low = (baseline_label or f"{lp_low}baseline").lower()
 
-    cura_set: set[str] = set()
-    fw_set: set[str] = set()
+    sets_by_train: dict[str, set[str]] = {}
     other_releases: list[str] = []
     is_baseline = False
     is_release_ticket = (
@@ -459,42 +524,52 @@ def extract_ticket_builds(
 
     for lbl in lbl_list:
         low = lbl.lower()
-        if low == "release:baseline":
+        if low == bl_low:
             is_baseline = True
-        elif low.startswith(("release:cura-", "release:slicer-")):
-            ver = lbl.split("-", 1)[1].strip()
-            if ver:
-                cura_set.add(ver)
-        elif low.startswith(("release:ultimoco-", "release:firmware-")):
-            ver = lbl.split("-", 1)[1].strip()
-            if ver:
-                fw_set.add(ver)
-        elif low.startswith("release:"):
-            val = lbl.split(":", 1)[1].strip()
-            if val and val not in other_releases:
-                other_releases.append(val)
+            continue
+        matched_configured = False
+        for tid, spec in trains_map.items():
+            for pref in _train_label_prefixes(tid, spec, label_prefix):
+                if low.startswith(pref):
+                    ver = lbl[len(pref) :].strip()
+                    if ver:
+                        sets_by_train.setdefault(tid, set()).add(ver)
+                    matched_configured = True
+                    break
+            if matched_configured:
+                break
+        if matched_configured:
+            continue
+        if low.startswith(lp_low):
+            rest = lbl[len(lp_low) :].strip()
+            if "-" in rest:
+                train_tok, ver = rest.split("-", 1)
+                if train_tok and _SEMVER_TOKEN_RE.match(ver.strip()):
+                    resolved_tid = _resolve_train_token(train_tok, trains_map)
+                    sets_by_train.setdefault(resolved_tid, set()).add(ver.strip())
+                    continue
+            if rest and rest not in other_releases:
+                other_releases.append(rest)
 
     for match in _RELEASED_IN_RE.finditer(body_text):
-        train_tok = match.group(1).lower()
+        train_tok = match.group(1).strip()
         ver_tok = match.group(2).strip()
-        if not ver_tok:
+        if not train_tok or not ver_tok:
             continue
-        if train_tok in ("slicer", "cura"):
-            cura_set.add(ver_tok)
-        elif train_tok in ("firmware", "ultimoco"):
-            fw_set.add(ver_tok)
+        resolved_tid = _resolve_train_token(train_tok, trains_map)
+        sets_by_train.setdefault(resolved_tid, set()).add(ver_tok)
 
     if is_release_ticket:
         ver_m = _SEMVER_TOKEN_RE.search(title_text)
         if ver_m:
             ver_val = ver_m.group(1)
             t_low = title_text.lower()
-            if "cura" in t_low or "slicer" in t_low or "cura-13401" in t_low:
-                cura_set.add(ver_val)
-            elif "ultimoco" in t_low or "firmware" in t_low or "emb-476" in t_low:
-                fw_set.add(ver_val)
+            for tid, spec in trains_map.items():
+                if any(kw in t_low for kw in _train_keywords(tid, spec)):
+                    sets_by_train.setdefault(tid, set()).add(ver_val)
+                    break
 
-    for raw_field, target_set in ((cura_field, cura_set), (firmware_field, fw_set)):
+    for raw_key, raw_field in (project_fields or {}).items():
         cleaned = (raw_field or "").strip()
         if not cleaned or cleaned in ("-", "none", "N/A"):
             continue
@@ -503,19 +578,25 @@ def extract_ticket_builds(
         if cleaned.lower() == "baseline":
             is_baseline = True
             continue
+        resolved_tid = _resolve_train_token(raw_key, trains_map)
         for part in cleaned.split(","):
             tok = part.strip()
             m = _SEMVER_TOKEN_RE.search(tok)
             if m:
-                target_set.add(m.group(1))
+                sets_by_train.setdefault(resolved_tid, set()).add(m.group(1))
 
-    cura_builds = sorted(cura_set, key=parse_semver_sort_key)
-    fw_builds = sorted(fw_set, key=parse_semver_sort_key)
+    ordered_ids: list[str] = [tid for tid in trains_map if tid in sets_by_train]
+    for tid in sorted(sets_by_train):
+        if tid not in ordered_ids:
+            ordered_ids.append(tid)
+
+    builds: dict[str, list[str]] = {
+        tid: sorted(sets_by_train[tid], key=parse_semver_sort_key) for tid in ordered_ids
+    }
+    primary_builds: dict[str, str] = {tid: vers[0] for tid, vers in builds.items() if vers}
     return {
-        "cura_builds": cura_builds,
-        "firmware_builds": fw_builds,
-        "cura_build": cura_builds[0] if cura_builds else "",
-        "firmware_build": fw_builds[0] if fw_builds else "",
+        "builds": builds,
+        "primary_builds": primary_builds,
         "is_baseline": is_baseline,
         "is_release_ticket": is_release_ticket,
         "other_releases": other_releases,
@@ -535,8 +616,7 @@ class Ticket:
     priority: str = ""
     milestone: str = ""
     target_repo: str = ""
-    cura_build: str = ""
-    firmware_build: str = ""
+    release_builds: dict[str, str] = field(default_factory=dict)
     depends_on: list[int] = field(default_factory=list)
     blocks: list[int] = field(default_factory=list)
     unmet_deps: list[int] = field(default_factory=list)
@@ -573,17 +653,37 @@ class Ticket:
             return ("target", self.deposit.target_repo.lower())
         return self.repo_key()
 
-    def build_info(self) -> dict[str, Any]:
+    def build_info(
+        self,
+        trains: dict[str, Any] | list[Any] | None = None,
+        *,
+        label_prefix: str = "release:",
+        baseline_label: str = "release:baseline",
+    ) -> dict[str, Any]:
         return extract_ticket_builds(
             self.labels,
             self.body,
             self.title,
-            cura_field=self.cura_build,
-            firmware_field=self.firmware_build,
+            project_fields=self.release_builds,
+            trains=trains,
+            label_prefix=label_prefix,
+            baseline_label=baseline_label,
         )
 
-    def to_dict(self) -> dict[str, Any]:
-        binfo = self.build_info()
+    def to_dict(
+        self,
+        trains: dict[str, Any] | list[Any] | None = None,
+        *,
+        label_prefix: str = "release:",
+        baseline_label: str = "release:baseline",
+    ) -> dict[str, Any]:
+        binfo = self.build_info(
+            trains=trains,
+            label_prefix=label_prefix,
+            baseline_label=baseline_label,
+        )
+        merged_primary = dict(self.release_builds)
+        merged_primary.update(binfo["primary_builds"])
         return {
             "number": self.number,
             "title": self.title,
@@ -599,12 +699,11 @@ class Ticket:
             "labels": list(self.labels),
             "priority": self.priority,
             "milestone": self.milestone,
-            "cura_build": binfo["cura_build"] or self.cura_build,
-            "firmware_build": binfo["firmware_build"] or self.firmware_build,
-            "cura_builds": binfo["cura_builds"],
-            "firmware_builds": binfo["firmware_builds"],
+            "builds": binfo["builds"],
+            "release_builds": merged_primary,
             "is_baseline": binfo["is_baseline"],
             "is_release_ticket": binfo["is_release_ticket"],
+            "other_releases": binfo["other_releases"],
             "depends_on": list(self.depends_on),
             "blocks": list(self.blocks),
             "unmet_deps": list(self.unmet_deps),

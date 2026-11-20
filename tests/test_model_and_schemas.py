@@ -266,44 +266,108 @@ def test_generic_taxonomy_ready_gate_and_dependency_waves() -> None:
 
 
 def test_extract_ticket_builds_and_short_versions() -> None:
+    import tomllib
+
+    from herdr_kanban.config import BoardConfig, ReleaseTrainSpec, render_board_config_toml
     from herdr_kanban.model import extract_ticket_builds, short_build_version
 
-    assert short_build_version("5.15.0-alpha.44+unimotion") == "5.15.0-alpha.44"
-    assert short_build_version("12.0.0-alpha.17+unimotion") == "12.0.0-alpha.17"
+    assert short_build_version("2.4.0-alpha.12+dev") == "2.4.0-alpha.12"
+    assert short_build_version("1.0.0-beta.3+ci.42") == "1.0.0-beta.3"
+
+    trains = {
+        "app": ReleaseTrainSpec(
+            id="app",
+            name="Desktop App",
+            short_name="App",
+            aliases=["client"],
+            label_prefixes=["release:app-", "release:client-"],
+            project_field="App Build",
+            keywords=["desktop app", "app"],
+        ),
+        "backend": ReleaseTrainSpec(
+            id="backend",
+            name="Backend",
+            short_name="API",
+            aliases=["api"],
+            label_prefixes=["release:backend-", "release:api-"],
+            project_field="Backend Build",
+            keywords=["backend", "api"],
+        ),
+    }
 
     # Cross-train ticket with both release labels
     b1 = extract_ticket_builds(
         [
-            "domain:slicing",
-            "domain:rt-control",
+            "domain:api",
+            "domain:ui",
             "type:bug",
-            "release:cura-5.15.0-alpha.44+unimotion",
-            "release:ultimoco-12.0.0-alpha.17+unimotion",
+            "release:app-2.4.0-alpha.12+dev",
+            "release:api-1.0.0-alpha.5+dev",
         ],
-        "Jira: CURA-13401, EMB-476.",
-        "[EMB-476][CURA-13401] Fix concentric G3 seam notch",
+        "Fix token refresh retry loop",
+        "Fix token refresh retry loop",
+        trains=trains,
     )
-    assert b1["cura_build"] == "5.15.0-alpha.44+unimotion"
-    assert b1["firmware_build"] == "12.0.0-alpha.17+unimotion"
+    assert b1["primary_builds"]["app"] == "2.4.0-alpha.12+dev"
+    assert b1["primary_builds"]["backend"] == "1.0.0-alpha.5+dev"
     assert not b1["is_baseline"]
     assert not b1["is_release_ticket"]
 
     # Ticket whose build is recorded via Released-In body line or Project field
     b2 = extract_ticket_builds(
-        ["domain:slicing", "type:bug"],
-        "Jira: CURA-13401.\n\n- Released-In: unimotion#209 (slicer: `5.15.0-alpha.41+unimotion`)",
-        "Fix Layer-0 flow compounding",
-        firmware_field="12.0.0-alpha.15+unimotion",
+        ["domain:ui", "type:bug"],
+        "Summary.\n\n- Released-In: #209 (client: `2.4.0-alpha.10+dev`)",
+        "Fix layout flicker",
+        project_fields={"backend": "1.0.0-alpha.4+dev"},
+        trains=trains,
     )
-    assert b2["cura_build"] == "5.15.0-alpha.41+unimotion"
-    assert b2["firmware_build"] == "12.0.0-alpha.15+unimotion"
+    assert b2["primary_builds"]["app"] == "2.4.0-alpha.10+dev"
+    assert b2["primary_builds"]["backend"] == "1.0.0-alpha.4+dev"
 
     # Release ticket itself
     b3 = extract_ticket_builds(
-        ["domain:som", "type:chore"],
+        ["domain:api", "type:chore"],
         "release-ticket:true",
-        "[EMB-476][release] Ultimoco C++23 12.0.0-alpha.17+unimotion",
+        "[release] Backend 1.0.0-alpha.5+dev",
+        trains=trains,
     )
     assert b3["is_release_ticket"]
-    assert b3["firmware_build"] == "12.0.0-alpha.17+unimotion"
+    assert b3["primary_builds"]["backend"] == "1.0.0-alpha.5+dev"
+
+    # Zero-config auto-discovery from release:<train>-<semver> labels
+    b4 = extract_ticket_builds(
+        ["release:cli-0.9.1", "release:web-3.2.0-rc.1"],
+        "",
+        "Ship CLI and web updates",
+    )
+    assert b4["primary_builds"]["cli"] == "0.9.1"
+    assert b4["primary_builds"]["web"] == "3.2.0-rc.1"
+
+    # Round-trip [releases] and [releases.trains.*] through TOML config
+    cfg = BoardConfig.from_mapping(
+        {
+            "board": {"project_owner": "acme", "project_number": 7, "target_branch": "main"},
+            "releases": {
+                "label_prefix": "release:",
+                "baseline_label": "release:baseline",
+                "trains": {
+                    "app": {
+                        "name": "Desktop App",
+                        "short_name": "App",
+                        "aliases": ["client"],
+                        "label_prefixes": ["release:app-", "release:client-"],
+                        "project_field": "App Build",
+                        "color": "green",
+                        "repos": ["desktop-app"],
+                        "domains": ["ui"],
+                    }
+                },
+            },
+        }
+    )
+    rendered = render_board_config_toml(cfg)
+    reloaded = BoardConfig.from_mapping(tomllib.loads(rendered))
+    assert "app" in reloaded.release_trains
+    assert reloaded.release_trains["app"].project_field == "App Build"
+    assert reloaded.release_trains["app"].aliases == ["client"]
 
