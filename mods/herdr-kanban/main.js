@@ -14,6 +14,7 @@ import {
   nextCommand,
   props,
   shared,
+  setShared,
   checking,
 } from "herdr";
 
@@ -809,6 +810,7 @@ export default class KanbanBoard extends View {
     }
     bus.resolvedCwdBySpace ??= {};
     bus.boardBySpace ??= {};
+    bus.syncSeq ??= 0;
     bus.views.add(this);
     this.bus = bus;
 
@@ -996,6 +998,40 @@ export default class KanbanBoard extends View {
       if (patch.drawerHeight !== undefined) v.drawerHeight = patch.drawerHeight;
       if (patch.modalMode !== undefined) v.modalMode = patch.modalMode;
     }
+    if (!checking()) {
+      this.bus.syncSeq = (this.bus.syncSeq || 0) + 1;
+      try {
+        setShared("kanban.sync", this.bus.syncSeq);
+      } catch {}
+    }
+    if (cx) cx.notify();
+  }
+
+  broadcastBoardState(patch, cx) {
+    const targets = this.bus && this.bus.views ? Array.from(this.bus.views) : [this];
+    for (const v of targets) {
+      if (patch.board !== undefined) v.board = patch.board;
+      if (patch.noKanbanInSpace !== undefined) v.noKanbanInSpace = patch.noKanbanInSpace;
+      if (patch.activeCwd !== undefined) v.activeCwd = patch.activeCwd;
+      if (patch.loading !== undefined) v.loading = patch.loading;
+      if (patch.error !== undefined) v.error = patch.error;
+      if (patch.statusMessage !== undefined) v.statusMessage = patch.statusMessage;
+      if (patch.board !== undefined) {
+        if (patch.board && patch.board.settings && patch.board.settings.default_agent_kind && !v.userPickedAgent) {
+          v.agentKind = patch.board.settings.default_agent_kind;
+        }
+        if (patch.board && !v.depositRepo && patch.board.default_repo) {
+          v.depositRepo = patch.board.default_repo;
+        }
+        v.syncSelectionAfterLoad();
+      }
+    }
+    if (!checking() && this.bus) {
+      this.bus.syncSeq = (this.bus.syncSeq || 0) + 1;
+      try {
+        setShared("kanban.sync", this.bus.syncSeq);
+      } catch {}
+    }
     if (cx) cx.notify();
   }
 
@@ -1025,18 +1061,33 @@ export default class KanbanBoard extends View {
     const reqSeq = ++this.refreshSeq;
 
     if (!candidates.length) {
-      this.board = null;
-      this.noKanbanInSpace = true;
-      this.loading = false;
-      this.error = "";
-      cx.notify();
+      this.broadcastBoardState(
+        {
+          board: null,
+          noKanbanInSpace: true,
+          loading: false,
+          error: "",
+          statusMessage: "",
+        },
+        cx
+      );
       return;
     }
     this.loadingTargetKey = targetKey;
     if (!silent) {
-      this.loading = true;
-      this.error = "";
-      cx.notify();
+      if (!checking() && props()?.part === "bar" && (!this.bus || this.bus.views.size <= 1)) {
+        try {
+          setShared("kanban.nav", { seq: Date.now(), refresh: true });
+        } catch {}
+      }
+      this.broadcastBoardState(
+        {
+          loading: true,
+          error: "",
+          statusMessage: "Refreshing board…",
+        },
+        cx
+      );
     }
 
     cx.spawn(async (cx) => {
@@ -1085,47 +1136,63 @@ export default class KanbanBoard extends View {
             lowerErr.includes("no such file or directory") ||
             lowerErr.includes("command not found");
           if (isNoBoard) {
-            this.board = null;
-            this.noKanbanInSpace = true;
-            this.error = "";
             if (tgt.spaceId && this.bus?.boardBySpace) {
               delete this.bus.boardBySpace[tgt.spaceId];
             }
+            this.broadcastBoardState(
+              {
+                board: null,
+                noKanbanInSpace: true,
+                error: "",
+                loading: false,
+                statusMessage: "",
+              },
+              cx
+            );
           } else if (!silent || !this.board) {
-            this.noKanbanInSpace = false;
-            this.error = parsedErr;
+            this.broadcastBoardState(
+              {
+                noKanbanInSpace: false,
+                error: parsedErr,
+                loading: false,
+                statusMessage: "",
+              },
+              cx
+            );
+          } else {
+            this.broadcastBoardState({ loading: false, statusMessage: "" }, cx);
           }
-          this.loading = false;
-          cx.notify();
           return;
         }
 
         const data = JSON.parse(res.stdout);
-        this.board = data;
-        this.noKanbanInSpace = false;
-        this.activeCwd = chosenCwd;
         if (this.bus && tgt.spaceId) {
           this.bus.boardBySpace ??= {};
           this.bus.boardBySpace[tgt.spaceId] = data;
         }
-        this.error = "";
-        this.loading = false;
-
-        if (data.settings && data.settings.default_agent_kind && !this.userPickedAgent) {
-          this.agentKind = data.settings.default_agent_kind;
-        }
-        if (!this.depositRepo && data.default_repo) {
-          this.depositRepo = data.default_repo;
-        }
-        this.syncSelectionAfterLoad();
-        cx.notify();
+        this.broadcastBoardState(
+          {
+            board: data,
+            noKanbanInSpace: false,
+            activeCwd: chosenCwd,
+            error: "",
+            loading: false,
+            statusMessage: "",
+          },
+          cx
+        );
       } catch (err) {
         if (reqSeq !== this.refreshSeq) return;
-        if (!silent || !this.board) {
-          this.error = String(err && err.message ? err.message : err);
-        }
-        this.loading = false;
-        cx.notify();
+        this.broadcastBoardState(
+          {
+            ...(!silent || !this.board
+              ? { error: String(err && err.message ? err.message : err) }
+              : {}),
+            loading: false,
+            statusMessage: "",
+          },
+          cx
+        );
       }
     });
   }
@@ -2202,8 +2269,9 @@ export default class KanbanBoard extends View {
                 })
               )
               .child(
-                btn("btn-refresh", "", t, {
+                btn("btn-refresh", this.loading ? "Refreshing…" : "", t, {
                   small: true,
+                  selected: Boolean(this.loading),
                   iconPath: "mods/herdr-kanban/refresh.svg",
                   onClick: (_ev, cx) => this.refresh(cx, false),
                 })
