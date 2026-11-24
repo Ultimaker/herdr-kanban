@@ -115,23 +115,7 @@ def default_gh_runner(args: list[str], stdin_data: str | None = None) -> subproc
     )
 
 
-PROJECT_BOARD_QUERY = """
-query($owner: String!, $number: Int!, $cursor: String, $priorityField: String!) {
-  repositoryOwner(login: $owner) {
-    login
-    ... on Organization {
-      projectV2(number: $number) {
-        ...ProjectFields
-      }
-    }
-    ... on User {
-      projectV2(number: $number) {
-        ...ProjectFields
-      }
-    }
-  }
-}
-
+_PROJECT_FIELDS_FRAGMENT = """
 fragment ProjectFields on ProjectV2 {
   id
   number
@@ -157,7 +141,7 @@ fragment ProjectFields on ProjectV2 {
       }
     }
   }
-  fields(first: 40) {
+  fields(first: 25) {
     nodes {
       ... on ProjectV2Field {
         id
@@ -188,7 +172,7 @@ fragment ProjectFields on ProjectV2 {
           optionId
         }
       }
-      fieldValues(first: 20) {
+      fieldValues(first: 8) {
         nodes {
           ... on ProjectV2ItemFieldTextValue {
             text
@@ -218,8 +202,8 @@ fragment ProjectFields on ProjectV2 {
           url
           updatedAt
           author { login }
-          assignees(first: 10) { nodes { login } }
-          labels(first: 25) { nodes { name } }
+          assignees(first: 5) { nodes { login } }
+          labels(first: 15) { nodes { name } }
           milestone {
             number
             title
@@ -228,7 +212,7 @@ fragment ProjectFields on ProjectV2 {
             name
             owner { login }
           }
-          comments(last: 30) {
+          comments(last: 5) {
             totalCount
             nodes {
               databaseId
@@ -243,6 +227,34 @@ fragment ProjectFields on ProjectV2 {
   }
 }
 """
+
+PROJECT_BOARD_QUERY = (
+    """
+query($owner: String!, $number: Int!, $cursor: String, $priorityField: String!) {
+  organization(login: $owner) {
+    login
+    projectV2(number: $number) {
+      ...ProjectFields
+    }
+  }
+}
+"""
+    + _PROJECT_FIELDS_FRAGMENT
+)
+
+USER_PROJECT_BOARD_QUERY = (
+    """
+query($owner: String!, $number: Int!, $cursor: String, $priorityField: String!) {
+  user(login: $owner) {
+    login
+    projectV2(number: $number) {
+      ...ProjectFields
+    }
+  }
+}
+"""
+    + _PROJECT_FIELDS_FRAGMENT
+)
 
 LIST_PROJECTS_QUERY = """
 query($owner: String!) {
@@ -314,6 +326,7 @@ class GitHubClient:
         self._run = runner
         self._user_cache: str | None = None
         self._collab_cache: dict[tuple[str, str], set[str]] = {}
+        self._owner_kind_cache: dict[str, str] = {}
 
     def _gh_json(
         self,
@@ -413,24 +426,45 @@ class GitHubClient:
         cursor: str | None = None
         schema: ProjectSchema | None = None
         tickets: list[Ticket] = []
+        owner_key = project_owner.lower()
+        owner_kind = self._owner_kind_cache.get(owner_key, "organization")
 
         while True:
-            data = self.graphql(
-                PROJECT_BOARD_QUERY,
-                {
-                    "owner": project_owner,
-                    "number": project_number,
-                    "cursor": cursor,
-                    "priorityField": priority_field or "Priority",
-                },
-            )
-            owner_node = data.get("repositoryOwner") or {}
-            proj = owner_node.get("projectV2")
+            variables = {
+                "owner": project_owner,
+                "number": project_number,
+                "cursor": cursor,
+                "priorityField": priority_field or "Priority",
+            }
+            if owner_kind == "organization":
+                try:
+                    data = self.graphql(PROJECT_BOARD_QUERY, variables)
+                    owner_node = data.get("organization") or data.get("repositoryOwner") or {}
+                    proj = owner_node.get("projectV2")
+                except GitHubError as exc:
+                    if cursor is None and "could not resolve to an organization" in str(exc).lower():
+                        owner_kind = "user"
+                        data = self.graphql(USER_PROJECT_BOARD_QUERY, variables)
+                        owner_node = data.get("user") or data.get("repositoryOwner") or {}
+                        proj = owner_node.get("projectV2")
+                    else:
+                        raise
+                if not isinstance(proj, dict) and cursor is None:
+                    owner_kind = "user"
+                    data = self.graphql(USER_PROJECT_BOARD_QUERY, variables)
+                    owner_node = data.get("user") or data.get("repositoryOwner") or {}
+                    proj = owner_node.get("projectV2")
+            else:
+                data = self.graphql(USER_PROJECT_BOARD_QUERY, variables)
+                owner_node = data.get("user") or data.get("repositoryOwner") or {}
+                proj = owner_node.get("projectV2")
+
             if not isinstance(proj, dict):
                 raise GitHubError(
                     f"GitHub Project #{project_number} under '{project_owner}' not found "
                     "(ensure `gh auth refresh -s project` scope is granted)"
                 )
+            self._owner_kind_cache[owner_key] = owner_kind
 
             if schema is None:
                 status_field = proj.get("field") or {}

@@ -339,7 +339,7 @@ def _filter_tickets(
 
 def cmd_board(args: argparse.Namespace, engine: KanbanEngine) -> int:
     ctx = engine.resolve_context(Path(args.cwd) if args.cwd else None)
-    schema, all_tickets = engine.refresh_board(ctx)
+    schema, all_tickets = engine.refresh_board(ctx, use_cache=not getattr(args, "no_cache", False))
     tickets = _filter_tickets(
         ctx,
         engine,
@@ -412,7 +412,7 @@ def cmd_board(args: argparse.Namespace, engine: KanbanEngine) -> int:
 
 def cmd_list(args: argparse.Namespace, engine: KanbanEngine) -> int:
     ctx = engine.resolve_context(Path(args.cwd) if args.cwd else None)
-    schema, all_tickets = engine.refresh_board(ctx)
+    schema, all_tickets = engine.refresh_board(ctx, use_cache=not getattr(args, "no_cache", False))
     tickets = _filter_tickets(
         ctx,
         engine,
@@ -458,7 +458,7 @@ def cmd_list(args: argparse.Namespace, engine: KanbanEngine) -> int:
 
 def cmd_show(args: argparse.Namespace, engine: KanbanEngine) -> int:
     ctx = engine.resolve_context(Path(args.cwd) if args.cwd else None)
-    _, tickets = engine.refresh_board(ctx)
+    _, tickets = engine.refresh_board(ctx, use_cache=not getattr(args, "no_cache", False))
     entry, issue_num = engine.resolve_ticket_target(ctx, args.issue, tickets)
     key = (entry.owner.lower(), entry.repo.lower())
     ticket = next(
@@ -828,7 +828,7 @@ def cmd_whats_new(args: argparse.Namespace, engine: KanbanEngine) -> int:
     if cached is not None and not getattr(args, "refresh", False):
         _, tickets = cached
     else:
-        _, tickets = engine.refresh_board(ctx)
+        _, tickets = engine.refresh_board(ctx, use_cache=not getattr(args, "refresh", False))
 
     limit = int(getattr(args, "limit", 25) or 25)
     if getattr(args, "prompt", False):
@@ -879,7 +879,7 @@ def cmd_changelog(args: argparse.Namespace, engine: KanbanEngine) -> int:
     if cached is not None and not getattr(args, "refresh", False):
         _, tickets = cached
     else:
-        _, tickets = engine.refresh_board(ctx)
+        _, tickets = engine.refresh_board(ctx, use_cache=not getattr(args, "refresh", False))
 
     payload = engine.build_release_changelog(
         ctx,
@@ -1222,6 +1222,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_board.add_argument("-p", "--priority", help="Filter by Project Priority")
     p_board.add_argument("-m", "--milestone", help="Filter by Milestone title")
     p_board.add_argument("--unblocked", action="store_true", help="Only tickets with zero open dependencies")
+    p_board.add_argument("--no-cache", action="store_true", help="Bypass the local disk TTL cache")
     p_board.add_argument("--json", action="store_true", help="Output JSON")
 
     # list
@@ -1234,12 +1235,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("-l", "--label", action="append", help="Filter by label or facet=value (repeatable)")
     p_list.add_argument("-p", "--priority", help="Filter by Project Priority")
     p_list.add_argument("-m", "--milestone", help="Filter by Milestone title")
+    p_list.add_argument("--no-cache", action="store_true", help="Bypass the local disk TTL cache")
     p_list.add_argument("--json", action="store_true", help="Output JSON")
 
     # show
     p_show = sub.add_parser("show", help="Inspect a single issue (`42` or `repo#42`) and its claim")
     p_show.add_argument("issue", help="Ticket reference (`42` or `repo#42`)")
     p_show.add_argument("--cwd", help="Repository or umbrella directory")
+    p_show.add_argument("--no-cache", action="store_true", help="Bypass the local disk TTL cache")
     p_show.add_argument("--json", action="store_true", help="Output JSON")
 
     # claim
