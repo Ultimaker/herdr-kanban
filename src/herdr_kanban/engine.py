@@ -430,7 +430,29 @@ class KanbanEngine:
                 return ticket
         return None
 
-    def refresh_board(self, ctx: RepoContext) -> tuple[ProjectSchema, list[Ticket]]:
+    def invalidate_board_cache(self, ctx: RepoContext) -> None:
+        state.invalidate_board_cache(
+            ctx.slug,
+            ctx.board.project_number,
+            project_owner=ctx.board.project_owner,
+        )
+
+    def refresh_board(
+        self,
+        ctx: RepoContext,
+        *,
+        use_cache: bool = True,
+        max_age_sec: float | None = None,
+    ) -> tuple[ProjectSchema, list[Ticket]]:
+        if use_cache:
+            ttl = state.board_cache_ttl_sec() if max_age_sec is None else max(0.0, float(max_age_sec))
+            if ttl > 0.0:
+                cached_board = self.load_cached_board(ctx)
+                if cached_board is not None:
+                    fetched_at, cached_schema, cached_tickets = cached_board
+                    if cached_schema.project_id and (time.time() - fetched_at) < ttl:
+                        return cached_schema, cached_tickets
+
         extra_kwargs: dict[str, Any] = {}
         if ctx.board.priority_field and ctx.board.priority_field != "Priority":
             extra_kwargs["priority_field"] = ctx.board.priority_field
@@ -492,12 +514,18 @@ class KanbanEngine:
                 "options_by_name": dict(schema.options_by_name),
                 "priority_field_id": schema.priority_field_id,
                 "priority_options_by_name": dict(schema.priority_options_by_name),
+                "text_fields_by_name": dict(schema.text_fields_by_name),
             },
+            project_owner=ctx.board.project_owner,
         )
         return schema, tickets
 
     def load_cached_board(self, ctx: RepoContext) -> tuple[float, ProjectSchema, list[Ticket]] | None:
-        cached = state.load_board_cache_with_schema(ctx.slug, ctx.board.project_number)
+        cached = state.load_board_cache_with_schema(
+            ctx.slug,
+            ctx.board.project_number,
+            project_owner=ctx.board.project_owner,
+        )
         if cached is None:
             return None
         fetched_at, schema_raw, rows = cached
@@ -517,6 +545,7 @@ class KanbanEngine:
                 options_by_name=dict(schema_raw.get("options_by_name") or {}),
                 priority_field_id=str(schema_raw.get("priority_field_id") or ""),
                 priority_options_by_name=dict(schema_raw.get("priority_options_by_name") or {}),
+                text_fields_by_name=dict(schema_raw.get("text_fields_by_name") or {}),
             )
         else:
             schema = ProjectSchema(
@@ -529,7 +558,11 @@ class KanbanEngine:
         return fetched_at, schema, tickets
 
     def load_cached_tickets(self, ctx: RepoContext) -> tuple[float, list[Ticket]] | None:
-        cached = state.load_board_cache(ctx.slug, ctx.board.project_number)
+        cached = state.load_board_cache(
+            ctx.slug,
+            ctx.board.project_number,
+            project_owner=ctx.board.project_owner,
+        )
         if cached is None:
             return None
         fetched_at, rows = cached
@@ -1589,7 +1622,7 @@ class KanbanEngine:
             )
             milestone_results.append({"title": ms_title, "number": ms_num, "status": ms_status})
 
-        schema, _ = self.refresh_board(ctx)
+        schema, _ = self.refresh_board(ctx, use_cache=False)
         added_priorities: list[str] = []
         if ctx.board.priorities and (schema.priority_field_id or schema.project_id):
             added_priorities = self.github.ensure_single_select_options(
@@ -1608,6 +1641,7 @@ class KanbanEngine:
                     if fid:
                         build_fields.append(spec.project_field)
 
+        self.invalidate_board_cache(ctx)
         return {
             "issues_repo": f"{issues_entry.owner}/{issues_entry.repo}",
             "labels": label_results,
@@ -1680,7 +1714,7 @@ class KanbanEngine:
         force: bool = False,
     ) -> ClaimResult:
         chosen_kind = agent_kind or ctx.settings.default_agent_kind
-        schema, tickets = self.refresh_board(ctx)
+        schema, tickets = self.refresh_board(ctx, use_cache=False)
         entry, issue_number = self.resolve_ticket_target(ctx, ref, tickets)
         ticket = self._find_board_ticket(tickets, entry, issue_number, ctx.is_multi_repo)
         disp = f"{entry.alias}#{issue_number}" if ctx.is_multi_repo else f"#{issue_number}"
@@ -1841,6 +1875,7 @@ class KanbanEngine:
         ticket.claim_comment_id = my_cid
         ticket.column = Column.IN_PROGRESS
         populate_file_overlaps(tickets)
+        self.invalidate_board_cache(ctx)
         return ClaimResult(
             claim=local_claim,
             ticket=ticket,
@@ -1957,6 +1992,7 @@ class KanbanEngine:
                     force=force_remove_worktree,
                 )
             state.remove_local_claim(entry.slug, issue_number)
+        self.invalidate_board_cache(ctx)
         return entry, issue_number
 
     def update_progress(
@@ -1988,6 +2024,7 @@ class KanbanEngine:
             meta.checklist = checklist
 
         self.github.patch_comment(entry.owner, entry.repo, cid, render_claim_comment(meta))
+        self.invalidate_board_cache(ctx)
         if meta.checklist and all(
             item.strip().lower().startswith("[x]") for item in meta.checklist if item.strip()
         ):
@@ -2173,7 +2210,7 @@ class KanbanEngine:
         node_id = str(created.get("node_id") or "")
         url = str(created.get("html_url") or "")
 
-        schema, _ = self.refresh_board(ctx)
+        schema, _ = self.refresh_board(ctx, use_cache=False)
         item_id = ""
         if node_id:
             item_id = self.github.add_issue_to_project(schema.project_id, node_id)
@@ -2182,6 +2219,7 @@ class KanbanEngine:
                 if priority.strip():
                     self.github.set_item_priority(schema, item_id, priority.strip())
 
+        self.invalidate_board_cache(ctx)
         return Ticket(
             number=issue_number,
             title=title,
@@ -2337,6 +2375,7 @@ class KanbanEngine:
 
         ticket.depends_on = next_deps
         ticket.blocks = next_blks
+        self.invalidate_board_cache(ctx)
         return ticket
 
     def move_ticket(self, ctx: RepoContext, ref: TicketRefInput, column: Column) -> Ticket:
@@ -2344,7 +2383,9 @@ class KanbanEngine:
 
     def post_comment(self, ctx: RepoContext, ref: TicketRefInput, body: str) -> dict[str, Any]:
         entry, issue_number = self.resolve_ticket_target(ctx, ref)
-        return self.github.post_comment(entry.owner, entry.repo, issue_number, body)
+        posted = self.github.post_comment(entry.owner, entry.repo, issue_number, body)
+        self.invalidate_board_cache(ctx)
+        return posted
 
     def ask_ticket(
         self,
@@ -2439,6 +2480,7 @@ class KanbanEngine:
                     delivered_fast = True
                     break
 
+        self.invalidate_board_cache(ctx)
         return {
             "comment_id": cid,
             "url": posted["url"],
@@ -2521,6 +2563,7 @@ class KanbanEngine:
                     ticket.claim_comment_id,
                     render_claim_comment(ticket.claim),
                 )
+            self.invalidate_board_cache(ctx)
             self.herdr.notify(f"Kanban {disp} ready for Review", f"Approve push to {target} in TUI (`a`).")
             return LandingResult(
                 issue_number=issue_number,
@@ -2613,6 +2656,7 @@ class KanbanEngine:
                 )
                 removed_wt = True
 
+        self.invalidate_board_cache(ctx)
         return LandingResult(
             issue_number=issue_number,
             status="landed",

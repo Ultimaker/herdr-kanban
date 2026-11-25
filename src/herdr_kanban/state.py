@@ -287,9 +287,46 @@ def set_watermark(slug: str, issue_number: int, comment_id: int) -> None:
 
 # --- Board Snapshot Cache ---
 
+DEFAULT_BOARD_CACHE_TTL_SEC = 30.0
 
-def _cache_path(slug: str, project_number: int) -> Path:
-    return state_dir() / "cache" / f"{slug}-p{project_number}.json"
+
+def board_cache_dir() -> Path:
+    explicit = os.environ.get("HERDR_KANBAN_CACHE_DIR")
+    if explicit:
+        root = Path(explicit)
+    elif os.environ.get("HERDR_KANBAN_STATE_DIR"):
+        root = state_dir() / "cache"
+    else:
+        xdg_cache = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+        root = Path(xdg_cache) / "herdr-kanban"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+    except OSError:
+        fallback = Path(f"/tmp/herdr-kanban-cache-{os.getuid()}")
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
+def board_cache_ttl_sec() -> float:
+    raw = os.environ.get("HERDR_KANBAN_CACHE_TTL_SEC")
+    if raw is None or not raw.strip():
+        return DEFAULT_BOARD_CACHE_TTL_SEC
+    try:
+        return max(0.0, float(raw.strip()))
+    except ValueError:
+        return DEFAULT_BOARD_CACHE_TTL_SEC
+
+
+def _safe_cache_token(value: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in value.strip())
+    return safe or "default"
+
+
+def _cache_path(slug: str, project_number: int, *, project_owner: str = "") -> Path:
+    if project_owner.strip():
+        return board_cache_dir() / f"board-{_safe_cache_token(project_owner)}-{project_number}.json"
+    return board_cache_dir() / f"{slug}-p{project_number}.json"
 
 
 def save_board_cache(
@@ -297,15 +334,24 @@ def save_board_cache(
     project_number: int,
     tickets: list[dict[str, Any]],
     schema: dict[str, Any] | None = None,
+    *,
+    project_owner: str = "",
 ) -> None:
     payload: dict[str, Any] = {"fetched_at": time.time(), "tickets": tickets}
     if schema is not None:
         payload["schema"] = schema
-    _atomic_write_json(_cache_path(slug, project_number), payload)
+    _atomic_write_json(_cache_path(slug, project_number, project_owner=project_owner), payload)
 
 
-def load_board_cache(slug: str, project_number: int) -> tuple[float, list[dict[str, Any]]] | None:
-    raw = _read_json(_cache_path(slug, project_number), None)
+def load_board_cache(
+    slug: str,
+    project_number: int,
+    *,
+    project_owner: str = "",
+) -> tuple[float, list[dict[str, Any]]] | None:
+    raw = _read_json(_cache_path(slug, project_number, project_owner=project_owner), None)
+    if raw is None and project_owner:
+        raw = _read_json(_cache_path(slug, project_number), None)
     if not isinstance(raw, dict) or not isinstance(raw.get("tickets"), list):
         return None
     return float(raw.get("fetched_at") or 0.0), raw["tickets"]
@@ -314,12 +360,28 @@ def load_board_cache(slug: str, project_number: int) -> tuple[float, list[dict[s
 def load_board_cache_with_schema(
     slug: str,
     project_number: int,
+    *,
+    project_owner: str = "",
 ) -> tuple[float, dict[str, Any] | None, list[dict[str, Any]]] | None:
-    raw = _read_json(_cache_path(slug, project_number), None)
+    raw = _read_json(_cache_path(slug, project_number, project_owner=project_owner), None)
+    if raw is None and project_owner:
+        raw = _read_json(_cache_path(slug, project_number), None)
     if not isinstance(raw, dict) or not isinstance(raw.get("tickets"), list):
         return None
     schema_raw = raw.get("schema") if isinstance(raw.get("schema"), dict) else None
     return float(raw.get("fetched_at") or 0.0), schema_raw, raw["tickets"]
+
+
+def invalidate_board_cache(slug: str, project_number: int, *, project_owner: str = "") -> None:
+    paths = [_cache_path(slug, project_number, project_owner=project_owner)]
+    if project_owner:
+        paths.append(_cache_path(slug, project_number))
+    for path in paths:
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            pass
 
 
 # --- What's New Digest State ---
