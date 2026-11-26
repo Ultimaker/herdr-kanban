@@ -32,8 +32,22 @@ const ACTIVE_COL_MAX_WIDTH = 360;
 const EMPTY_COL_COMPACT_WIDTH = 104;
 const UNIFORM_COL_WIDTH = 248;
 const CARD_EST_HEIGHT = 124;
+const BACKGROUND_POLL_MS = 60000;
+const RATE_LIMIT_BASE_BACKOFF_MS = 60000;
+const RATE_LIMIT_MAX_BACKOFF_MS = 300000;
 const DEFAULT_PRIORITIES = ["P0", "P1", "P2", "P3"];
 const DEFAULT_AGENTS = ["agy", "claude", "codex", "opencode", "gemini", "copilot"];
+
+function isRateLimitError(message) {
+  const lower = String(message || "").toLowerCase();
+  return (
+    lower.includes("rate limit") ||
+    lower.includes("secondary rate") ||
+    lower.includes("http 403") ||
+    lower.includes("http 429") ||
+    lower.includes("api rate limit exceeded")
+  );
+}
 
 function withAlpha(hexColor, alphaHex) {
   const c = String(hexColor || "").trim();
@@ -897,9 +911,16 @@ export default class KanbanBoard extends View {
     }
     this.refresh(cx, false);
 
-    cx.timer.every(12000, (cx) => {
+    cx.timer.every(BACKGROUND_POLL_MS, (cx) => {
+      const backoffUntil = Math.max(
+        this.rateLimitBackoffUntil || 0,
+        this.bus?.rateLimitBackoffUntil || 0
+      );
+      if (Date.now() < backoffUntil) {
+        return;
+      }
       if (!this.loading && !this.busyText) {
-        this.refresh(cx, true);
+        this.refresh(cx, true, false);
       }
     });
 
@@ -914,7 +935,7 @@ export default class KanbanBoard extends View {
           } else if (cmd === "refresh" || cmd?.action === "refresh") {
             this.panX = 0;
             this.panY = 0;
-            this.refresh(cx, false);
+            this.refresh(cx, false, true);
           } else if (cmd === "center" || cmd?.action === "center") {
             this.panX = 0;
             this.panY = 0;
@@ -1012,7 +1033,14 @@ export default class KanbanBoard extends View {
     return exec("herdr-kanban", fullArgs, { cwd, on: tgt.on });
   }
 
-  refresh(cx, silent = false) {
+  refresh(cx, silent = false, forceFresh = false) {
+    const backoffUntil = Math.max(
+      this.rateLimitBackoffUntil || 0,
+      this.bus?.rateLimitBackoffUntil || 0
+    );
+    if (silent && Date.now() < backoffUntil) {
+      return;
+    }
     const tgt = this.target();
     const candidates =
       Array.isArray(tgt.candidates) && tgt.candidates.length
@@ -1039,6 +1067,7 @@ export default class KanbanBoard extends View {
       cx.notify();
     }
 
+    const boardArgs = forceFresh ? ["board", "--json", "--no-cache"] : ["board", "--json"];
     cx.spawn(async (cx) => {
       try {
         let lastRes = null;
@@ -1047,7 +1076,7 @@ export default class KanbanBoard extends View {
           chosenCwd = candCwd;
           let res = null;
           try {
-            res = await this.execKanban(["board", "--json"], { ...tgt, cwd: candCwd });
+            res = await this.execKanban(boardArgs, { ...tgt, cwd: candCwd });
           } catch {
             continue;
           }
@@ -1078,6 +1107,20 @@ export default class KanbanBoard extends View {
             const j = JSON.parse(stderr);
             if (j && j.error) parsedErr = j.error;
           } catch {}
+          if (isRateLimitError(parsedErr)) {
+            const streak = Math.max(this.rateLimitStreak || 0, this.bus?.rateLimitStreak || 0) + 1;
+            const delayMs = Math.min(
+              RATE_LIMIT_MAX_BACKOFF_MS,
+              RATE_LIMIT_BASE_BACKOFF_MS * Math.pow(2, streak - 1)
+            );
+            const until = Date.now() + delayMs;
+            this.rateLimitStreak = streak;
+            this.rateLimitBackoffUntil = until;
+            if (this.bus) {
+              this.bus.rateLimitStreak = streak;
+              this.bus.rateLimitBackoffUntil = until;
+            }
+          }
           const lowerErr = parsedErr.toLowerCase();
           const isNoBoard =
             lowerErr.includes(".herdr-kanban.toml") ||
@@ -1100,6 +1143,12 @@ export default class KanbanBoard extends View {
           return;
         }
 
+        this.rateLimitStreak = 0;
+        this.rateLimitBackoffUntil = 0;
+        if (this.bus) {
+          this.bus.rateLimitStreak = 0;
+          this.bus.rateLimitBackoffUntil = 0;
+        }
         const data = JSON.parse(res.stdout);
         this.board = data;
         this.noKanbanInSpace = false;
