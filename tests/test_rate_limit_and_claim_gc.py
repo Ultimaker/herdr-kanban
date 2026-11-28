@@ -390,3 +390,134 @@ def test_refresh_board_singleflight_coalesces_concurrent_cache_misses(
 
     assert results == [1, 1, 1, 1, 1, 1]
     assert fetch_count == 1
+    counters = state.load_telemetry_counters()
+    repo_stats = counters["repos"]["Ultimaker/app"]
+    assert repo_stats["board_cache_hits"] == 5
+    assert repo_stats["singleflight_coalesced"] == 5
+
+
+def test_telemetry_counters_surface_attribution_rate_limit_and_zero_pii(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """GitHubClient + KanbanEngine record REST/GraphQL/surface/GC/rate-limit counters with zero PII."""
+    repo, _ = _init_repo_with_board(tmp_path, monkeypatch)
+
+    def runner(args: list[str], stdin_data: str | None) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ["api", "graphql"]:
+            payload = json.loads(stdin_data or "{}")
+            if "rateLimitTrigger" in payload.get("query", ""):
+                return subprocess.CompletedProcess(
+                    args=args,
+                    returncode=1,
+                    stdout="",
+                    stderr="gh: API rate limit exceeded for user ID 12345 (HTTP 403)",
+                )
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "data": {
+                            "repository": {
+                                "i_99": {"state": "CLOSED", "comments": {"nodes": []}}
+                            }
+                        }
+                    }
+                ),
+                stderr="",
+            )
+        if args == ["api", "repos/Ultimaker/app/issues/99"]:
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout=json.dumps({"number": 99, "title": "Secret Title", "state": "open"}),
+                stderr="",
+            )
+        raise AssertionError(f"Unexpected call: {args}")
+
+    gh = GitHubClient(runner=runner)
+    gh.set_telemetry_owner("Ultimaker", "app")
+
+    monkeypatch.setenv("HERDR_KANBAN_SURFACE", "daemon")
+    snap = gh.fetch_issues_poll_snapshot("Ultimaker", "app", [99])
+    assert snap[99][0] == "CLOSED"
+
+    monkeypatch.setenv("HERDR_KANBAN_SURFACE", "gpui_mod")
+    gh.get_issue("Ultimaker", "app", 99)
+
+    monkeypatch.setenv("HERDR_KANBAN_SURFACE", "cli")
+    try:
+        gh.graphql("query { rateLimitTrigger }", {"owner": "Ultimaker"})
+    except Exception:
+        pass
+
+    # Non-Ultimaker call is isolated under its own `<Owner>/<Repo>` key
+    gh.set_telemetry_owner("jellespijker", "omabook")
+    try:
+        gh.graphql("query { rateLimitTrigger }", {"owner": "jellespijker", "repo": "omabook"})
+    except Exception:
+        pass
+
+    # Verify GC counter on closed claim
+    slug = config.repo_slug("Ultimaker", "app")
+    wt = tmp_path / "wt" / "issue-99"
+    wt.mkdir(parents=True, exist_ok=True)
+    state.save_local_claim(
+        state.LocalClaim(
+            repo_slug=slug,
+            repo_owner="Ultimaker",
+            repo_name="app",
+            main_repo_root=str(repo),
+            issue_number=99,
+            worktree_path=str(wt),
+            local_branch="kanban/issue-99",
+            target_branch="main",
+            remote="origin",
+            comment_id=999,
+            owner="jelle",
+            agent_kind="agy",
+        )
+    )
+    eng = KanbanEngine(github=gh, herdr=FakeHerdr())
+    eng.sync_claim_heartbeats_and_relays()
+
+    raw_text = state.telemetry_counters_path().read_text(encoding="utf-8")
+    assert "Secret Title" not in raw_text
+    assert str(tmp_path) not in raw_text
+    assert "12345" not in raw_text
+
+    counters = state.load_telemetry_counters()
+    app_entry = counters["repos"]["Ultimaker/app"]
+    assert app_entry["graphql_calls"] == 2  # initial poll + sync_claim_heartbeats_and_relays
+    assert app_entry["rest_calls"] == 1
+    assert app_entry["claims_gc_reaped"] == 1
+    assert app_entry["by_surface"]["daemon"]["graphql_calls"] == 1
+    assert app_entry["by_surface"]["gpui_mod"]["rest_calls"] == 1
+
+    proj_entry = counters["repos"]["Ultimaker/__project__"]
+    assert proj_entry["graphql_calls"] == 1
+    assert proj_entry["rate_limit_errors"] == 1
+
+    other_entry = counters["repos"]["jellespijker/omabook"]
+    assert other_entry["graphql_calls"] == 1
+    assert other_entry["rate_limit_errors"] == 1
+
+
+def test_triage_ticket_retries_fresh_board_when_missing_from_disk_cache(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """`triage_ticket` refreshes bypassing the 30s disk cache if the issue was added externally."""
+    repo, _ = _init_repo_with_board(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERDR_KANBAN_CACHE_TTL_SEC", "30")
+    gh = FakeGitHub(current_login="jelle")
+    gh.seed_issue(1, "Existing ticket", status="Ready")
+
+    engine = KanbanEngine(github=gh, herdr=FakeHerdr())  # type: ignore[arg-type]
+    ctx = engine.resolve_context(repo)
+    engine.refresh_board(ctx)  # Prime 30s disk cache with only #1
+
+    # External tool adds #2 to Project #7 without invalidating local disk cache
+    gh.seed_issue(2, "Externally added ticket", status="Triage")
+    updated = engine.triage_ticket(ctx, 2, column=Column.IN_PROGRESS, force=True)
+    assert updated.number == 2
+    assert updated.column == Column.IN_PROGRESS

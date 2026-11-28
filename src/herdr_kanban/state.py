@@ -6,13 +6,16 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import threading
 import time
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from . import __version__
 from .model import InboxItem
 
 _THREAD_LOCKS_GUARD = threading.Lock()
@@ -450,4 +453,139 @@ def load_whats_new_summary(slug: str, project_number: int) -> dict[str, Any] | N
     if not isinstance(raw, dict) or not raw.get("markdown"):
         return None
     return raw
+
+
+# --- Privacy-Safe GitHub Polling & Cache Telemetry Counters ---
+
+VALID_TELEMETRY_SURFACES: tuple[str, ...] = ("daemon", "gpui_mod", "tui", "cli")
+_REPO_KEY_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def telemetry_counters_path() -> Path:
+    return state_dir() / "telemetry-counters.json"
+
+
+def current_telemetry_surface(explicit: str = "") -> str:
+    cand = (explicit or os.environ.get("HERDR_KANBAN_SURFACE") or "cli").strip().lower()
+    return cand if cand in VALID_TELEMETRY_SURFACES else "cli"
+
+
+def normalize_telemetry_repo_key(repo_key: str) -> str:
+    raw = (repo_key or "").strip().strip("/")
+    if "/" not in raw:
+        return ""
+    owner, repo = raw.split("/", 1)
+    owner = owner.strip()
+    repo = repo.strip()
+    if not owner or not repo:
+        return ""
+    if not _REPO_KEY_TOKEN_RE.match(owner) or not _REPO_KEY_TOKEN_RE.match(repo):
+        return ""
+    return f"{owner}/{repo}"
+
+
+def load_telemetry_counters() -> dict[str, Any]:
+    raw = _read_json(telemetry_counters_path(), None)
+    if not isinstance(raw, dict) or not isinstance(raw.get("repos"), dict):
+        return {
+            "schema_version": 1,
+            "herdr_kanban_version": __version__,
+            "updated_at": "",
+            "repos": {},
+        }
+    return raw
+
+
+def record_telemetry_counter(
+    repo_key: str,
+    *,
+    surface: str = "",
+    rest_calls: int = 0,
+    graphql_calls: int = 0,
+    board_cache_hits: int = 0,
+    singleflight_coalesced: int = 0,
+    claims_gc_reaped: int = 0,
+    rate_limit_errors: int = 0,
+    version: str = "",
+) -> None:
+    """Atomically increment monotonic per-`<Owner>/<Repo>` GitHub polling & cache counters."""
+    norm_key = normalize_telemetry_repo_key(repo_key)
+    if not norm_key:
+        return
+    if not any(
+        x > 0
+        for x in (
+            rest_calls,
+            graphql_calls,
+            board_cache_hits,
+            singleflight_coalesced,
+            claims_gc_reaped,
+            rate_limit_errors,
+        )
+    ):
+        return
+
+    surf = current_telemetry_surface(surface)
+    ver = (version or __version__).strip() or __version__
+    now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path = telemetry_counters_path()
+
+    with contextlib.suppress(OSError), _locked(state_dir() / ".telemetry-counters.lock"):
+        data = _read_json(path, {})
+        if not isinstance(data, dict):
+            data = {}
+        repos = data.get("repos")
+        if not isinstance(repos, dict):
+            repos = {}
+
+        # Match existing case-insensitively if already recorded under canonical casing
+        canonical_key = norm_key
+        norm_lc = norm_key.lower()
+        for existing_key in repos:
+            if isinstance(existing_key, str) and existing_key.lower() == norm_lc:
+                canonical_key = existing_key
+                break
+
+        entry = repos.get(canonical_key)
+        if not isinstance(entry, dict):
+            entry = {}
+
+        for field_name, delta in (
+            ("rest_calls", rest_calls),
+            ("graphql_calls", graphql_calls),
+            ("board_cache_hits", board_cache_hits),
+            ("singleflight_coalesced", singleflight_coalesced),
+            ("claims_gc_reaped", claims_gc_reaped),
+            ("rate_limit_errors", rate_limit_errors),
+        ):
+            cur_val = int(entry.get(field_name) or 0)
+            entry[field_name] = cur_val + max(0, int(delta))
+
+        by_surface = entry.get("by_surface")
+        if not isinstance(by_surface, dict):
+            by_surface = {}
+        for s_name in VALID_TELEMETRY_SURFACES:
+            s_cur = by_surface.get(s_name)
+            if not isinstance(s_cur, dict):
+                by_surface[s_name] = {"rest_calls": 0, "graphql_calls": 0}
+            else:
+                by_surface[s_name] = {
+                    "rest_calls": int(s_cur.get("rest_calls") or 0),
+                    "graphql_calls": int(s_cur.get("graphql_calls") or 0),
+                }
+        if rest_calls > 0:
+            by_surface[surf]["rest_calls"] += int(rest_calls)
+        if graphql_calls > 0:
+            by_surface[surf]["graphql_calls"] += int(graphql_calls)
+        entry["by_surface"] = by_surface
+
+        repos[canonical_key] = entry
+        payload = {
+            "schema_version": 1,
+            "herdr_kanban_version": ver,
+            "updated_at": now_iso,
+            "repos": repos,
+        }
+        _atomic_write_json(path, payload)
+
 
