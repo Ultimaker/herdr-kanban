@@ -1056,17 +1056,40 @@ export default class KanbanBoard extends View {
     if (cx) cx.notify();
   }
 
-  execKanban(args, targetOverride) {
+  async execKanban(args, targetOverride) {
     const tgt = targetOverride || this.target();
     const cwd = (targetOverride && targetOverride.cwd) || this.activeCwd || tgt.cwd;
-    const fullArgs = args.length > 0 ? [args[0]] : [];
-    if (cwd) {
-      fullArgs.push("--cwd", cwd);
+    const peerKey = tgt.on || "local";
+    if (!this._legacyPeers) {
+      this._legacyPeers = new Set();
     }
-    if (args.length > 1) {
-      fullArgs.push(...args.slice(1));
+    const buildArgs = (includeSurface) => {
+      const fullArgs = includeSurface ? ["--surface", "gpui_mod"] : [];
+      if (args.length > 0) {
+        fullArgs.push(args[0]);
+      }
+      if (cwd) {
+        fullArgs.push("--cwd", cwd);
+      }
+      if (args.length > 1) {
+        fullArgs.push(...args.slice(1));
+      }
+      return fullArgs;
+    };
+    const opts = { cwd, on: tgt.on, env: { HERDR_KANBAN_SURFACE: "gpui_mod" } };
+    if (this._legacyPeers.has(peerKey)) {
+      return exec("herdr-kanban", buildArgs(false), opts);
     }
-    return exec("herdr-kanban", fullArgs, { cwd, on: tgt.on });
+    const res = await exec("herdr-kanban", buildArgs(true), opts);
+    if (
+      res &&
+      res.code !== 0 &&
+      String(res.stderr || "").includes("unrecognized arguments: --surface")
+    ) {
+      this._legacyPeers.add(peerKey);
+      return exec("herdr-kanban", buildArgs(false), opts);
+    }
+    return res;
   }
 
   refresh(cx, silent = false, forceFresh = false) {

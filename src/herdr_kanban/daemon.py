@@ -103,11 +103,14 @@ def ensure() -> bool:
     cli = config.ROOT / "bin" / "herdr-kanban"
     log_path = state.state_dir() / "daemon.log"
     with open(log_path, "a", encoding="utf-8") as log:
+        env = dict(os.environ)
+        env["HERDR_KANBAN_SURFACE"] = "daemon"
         subprocess.Popen(
-            [sys.executable, str(cli), "daemon"],
+            [sys.executable, str(cli), "--surface", "daemon", "daemon"],
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=log,
+            env=env,
             start_new_session=True,
             close_fds=True,
         )
@@ -115,6 +118,7 @@ def ensure() -> bool:
 
 
 def run() -> int:
+    os.environ["HERDR_KANBAN_SURFACE"] = "daemon"
     reap_legacy_session_daemons()
     handle = open(lock_path(), "a+", encoding="utf-8")  # noqa: SIM115 - held open as flock lifetime
     try:

@@ -184,6 +184,9 @@ class KanbanEngine:
                 )
                 primary = board.repos[primary_alias]
                 slug = f"umbrella__{config.repo_slug(board.project_owner, umbrella_dir.name)}"
+                set_tel = getattr(self.github, "set_telemetry_owner", None)
+                if callable(set_tel):
+                    set_tel(board.project_owner or primary.owner, primary.repo)
                 return RepoContext(
                     worktree_cwd=wt_root or start,
                     main_repo_root=main_root or primary.resolved_path(umbrella_dir),
@@ -214,6 +217,9 @@ class KanbanEngine:
         board.repo_owner = repo_owner
         board.repo_name = repo_name
         slug = config.repo_slug(repo_owner, repo_name)
+        set_tel = getattr(self.github, "set_telemetry_owner", None)
+        if callable(set_tel):
+            set_tel(board.project_owner or repo_owner, repo_name)
         single = config.RepoEntry(
             alias=repo_name,
             owner=repo_owner,
@@ -508,6 +514,17 @@ class KanbanEngine:
         )
         return schema, tickets
 
+    @staticmethod
+    def _telemetry_repo_key(ctx: RepoContext) -> str:
+        if ctx.is_multi_repo and ctx.board.issues_repo and ctx.board.issues_repo in ctx.repos:
+            ie = ctx.repos[ctx.board.issues_repo]
+            return f"{ie.owner}/{ie.repo}"
+        if ctx.repo_owner and ctx.repo_name:
+            return f"{ctx.repo_owner}/{ctx.repo_name}"
+        if ctx.board.project_owner:
+            return f"{ctx.board.project_owner}/__project__"
+        return ""
+
     def refresh_board(
         self,
         ctx: RepoContext,
@@ -518,10 +535,12 @@ class KanbanEngine:
         if use_cache:
             ttl = state.board_cache_ttl_sec() if max_age_sec is None else max(0.0, float(max_age_sec))
             if ttl > 0.0:
+                tel_repo = self._telemetry_repo_key(ctx)
                 cached_board = self.load_cached_board(ctx)
                 if cached_board is not None:
                     fetched_at, cached_schema, cached_tickets = cached_board
                     if cached_schema.project_id and (time.time() - fetched_at) < ttl:
+                        state.record_telemetry_counter(tel_repo, board_cache_hits=1)
                         return cached_schema, cached_tickets
                 with state.board_fetch_lock(
                     ctx.slug,
@@ -532,6 +551,11 @@ class KanbanEngine:
                     if cached_board is not None:
                         fetched_at, cached_schema, cached_tickets = cached_board
                         if cached_schema.project_id and (time.time() - fetched_at) < ttl:
+                            state.record_telemetry_counter(
+                                tel_repo,
+                                board_cache_hits=1,
+                                singleflight_coalesced=1,
+                            )
                             return cached_schema, cached_tickets
                     return self._fetch_and_cache_board_unlocked(ctx)
 
@@ -2278,6 +2302,10 @@ class KanbanEngine:
         schema, tickets = self.refresh_board(ctx)
         entry, issue_number = self.resolve_ticket_target(ctx, ref, tickets)
         ticket = self._find_board_ticket(tickets, entry, issue_number, ctx.is_multi_repo)
+        if ticket is None or not ticket.project_item_id:
+            schema, tickets = self.refresh_board(ctx, use_cache=False)
+            entry, issue_number = self.resolve_ticket_target(ctx, ref, tickets)
+            ticket = self._find_board_ticket(tickets, entry, issue_number, ctx.is_multi_repo)
         disp = f"{entry.alias}#{issue_number}" if ctx.is_multi_repo else f"#{issue_number}"
         if ticket is None or not ticket.project_item_id:
             raise KanbanError(f"Issue {disp} not found on Project #{ctx.board.project_number}")
@@ -2749,6 +2777,7 @@ class KanbanEngine:
                 bt_match.state.upper() == "CLOSED" or bt_match.column == Column.DONE
             ):
                 state.remove_local_claim(slug, local_claim.issue_number)
+                state.record_telemetry_counter(f"{owner}/{repo}", claims_gc_reaped=1)
                 hb_map.pop(f"{slug}:{local_claim.issue_number}", None)
                 continue
 
@@ -2800,6 +2829,7 @@ class KanbanEngine:
                 issue_state, snap_comments = repo_snap[local_claim.issue_number]
                 if issue_state in ("CLOSED", "MISSING"):
                     state.remove_local_claim(slug, local_claim.issue_number)
+                    state.record_telemetry_counter(f"{owner}/{repo}", claims_gc_reaped=1)
                     hb_map.pop(hb_key, None)
                     continue
                 comments = snap_comments
@@ -2811,6 +2841,7 @@ class KanbanEngine:
                     err_lc = str(exc).lower()
                     if "404" in err_lc or "not found" in err_lc or "410" in err_lc:
                         state.remove_local_claim(slug, local_claim.issue_number)
+                        state.record_telemetry_counter(f"{owner}/{repo}", claims_gc_reaped=1)
                         hb_map.pop(hb_key, None)
                     continue
 
@@ -2821,6 +2852,7 @@ class KanbanEngine:
                 or winning[1].state not in ("active", "review_ready")
             ):
                 state.remove_local_claim(slug, local_claim.issue_number)
+                state.record_telemetry_counter(f"{owner}/{repo}", claims_gc_reaped=1)
                 hb_map.pop(hb_key, None)
                 continue
 

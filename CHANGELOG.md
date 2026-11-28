@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.3 (2026-11-28)
+
+- **Privacy-Safe GitHub Polling, Cache & Claim-GC Telemetry Counters (`state.py`, `github.py`, `engine.py`, `daemon.py`, `tui.py`, `cli.py`, `mods/herdr-kanban/main.js`)**:
+  - Persist lock-safe monotonic counters in `~/.local/state/herdr-kanban/telemetry-counters.json` keyed solely by `<Owner>/<Repo>` (zero paths, usernames, tokens, or issue text): `rest_calls`, `graphql_calls`, `board_cache_hits`, `singleflight_coalesced`, `claims_gc_reaped`, `rate_limit_errors`, and per-surface (`daemon`, `gpui_mod`, `tui`, `cli`) API attribution.
+  - Attribute `daemon`, `tui`, `gpui_mod`, and `cli` surfaces via `HERDR_KANBAN_SURFACE` and `--surface`.
+- **`triage_ticket` Stale Disk-Cache Retry (`engine.py`)**:
+  - Automatically retry `refresh_board(ctx, use_cache=False)` once in `triage_ticket()` when a newly added project item is not yet present in the 30s disk board cache.
+
 ## 0.5.2 (2026-11-28)
 
 - **Eliminate Zombie Claim REST Polling & Duplicate Per-Session Daemons (`daemon.py`, `engine.py`, `github.py`, `state.py`)**:

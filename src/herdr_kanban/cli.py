@@ -1174,6 +1174,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"herdr-kanban {__version__}")
     parser.add_argument("--cwd", dest="_root_cwd", help="Repository or umbrella directory")
+    parser.add_argument(
+        "--surface",
+        dest="_surface",
+        choices=state.VALID_TELEMETRY_SURFACES,
+        help=argparse.SUPPRESS,
+    )
     sub = parser.add_subparsers(dest="command")
 
     # init
@@ -1577,6 +1583,8 @@ HANDLERS = {
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "_surface", None):
+        os.environ["HERDR_KANBAN_SURFACE"] = args._surface
     if getattr(args, "_root_cwd", None) and not getattr(args, "cwd", None):
         args.cwd = args._root_cwd
     if not args.command:

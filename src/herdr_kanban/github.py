@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -12,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import state
 from .model import (
     Column,
     DepositMeta,
@@ -37,6 +39,21 @@ def _is_missing_project_scope_error(detail: str) -> bool:
     return ("read:project" in lowered or "'project'" in lowered) and (
         "scope" in lowered or "insufficient_scopes" in lowered
     )
+
+
+def _is_rate_limit_text(detail: str) -> bool:
+    lowered = detail.lower()
+    return (
+        "rate limit" in lowered
+        or "rate_limited" in lowered
+        or "secondary rate" in lowered
+        or "abuse detection" in lowered
+        or "http 429" in lowered
+        or ("http 403" in lowered and "rate" in lowered)
+    )
+
+
+_REPOS_ENDPOINT_RE = re.compile(r"^/?repos/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?:/|\?|$)")
 
 
 def has_project_scope(auth_status_output: str) -> bool:
@@ -328,6 +345,69 @@ class GitHubClient:
         self._user_cache: str | None = None
         self._collab_cache: dict[tuple[str, str], set[str]] = {}
         self._owner_kind_cache: dict[str, str] = {}
+        self._project_owner_by_id: dict[str, str] = {}
+        self._telemetry_owner: str = ""
+        self._telemetry_repo: str = ""
+
+    def set_telemetry_owner(self, owner: str, repo: str = "") -> None:
+        self._telemetry_owner = (owner or "").strip()
+        self._telemetry_repo = (repo or "").strip()
+
+    def _default_telemetry_repo_key(self) -> str:
+        if self._telemetry_owner and self._telemetry_repo:
+            return f"{self._telemetry_owner}/{self._telemetry_repo}"
+        if self._telemetry_owner:
+            return f"{self._telemetry_owner}/__project__"
+        return ""
+
+    def _infer_api_repo_key(self, args: list[str], payload: dict[str, Any] | None = None) -> str:
+        if len(args) >= 2 and args[0] == "api" and args[1] == "graphql":
+            variables = (payload or {}).get("variables")
+            if isinstance(variables, dict):
+                owner = str(variables.get("owner") or "").strip()
+                repo = str(variables.get("repo") or "").strip()
+                if owner and repo:
+                    return f"{owner}/{repo}"
+                if owner:
+                    return f"{owner}/__project__"
+                proj_id = str(variables.get("projectId") or "").strip()
+                if proj_id and proj_id in self._project_owner_by_id:
+                    return f"{self._project_owner_by_id[proj_id]}/__project__"
+            return self._default_telemetry_repo_key()
+
+        if args and args[0] == "api":
+            for token in args[1:]:
+                if token.startswith("-"):
+                    continue
+                matched = _REPOS_ENDPOINT_RE.match(token)
+                if matched:
+                    return f"{matched.group(1)}/{matched.group(2)}"
+            return self._default_telemetry_repo_key()
+        return ""
+
+    def _run_api(
+        self,
+        args: list[str],
+        stdin_text: str | None = None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], str]:
+        repo_key = self._infer_api_repo_key(args, payload=payload)
+        is_graphql = len(args) >= 2 and args[0] == "api" and args[1] == "graphql"
+        proc = self._run(args, stdin_text)
+        rate_err = 0
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            if _is_rate_limit_text(detail):
+                rate_err = 1
+        if repo_key and args and args[0] == "api":
+            state.record_telemetry_counter(
+                repo_key,
+                rest_calls=0 if is_graphql else 1,
+                graphql_calls=1 if is_graphql else 0,
+                rate_limit_errors=rate_err,
+            )
+        return proc, repo_key
 
     def _gh_json(
         self,
@@ -339,7 +419,7 @@ class GitHubClient:
         final_args = list(args)
         if payload is not None and "--input" not in final_args:
             final_args.extend(["--input", "-"])
-        proc = self._run(final_args, stdin_text)
+        proc, _ = self._run_api(final_args, stdin_text, payload=payload)
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout).strip()
             if _is_missing_project_scope_error(detail):
@@ -361,6 +441,10 @@ class GitHubClient:
         resp = self._gh_json(["api", "graphql"], payload=payload)
         if isinstance(resp, dict) and resp.get("errors"):
             messages = "; ".join(str(e.get("message", e)) for e in resp["errors"])
+            if _is_rate_limit_text(messages):
+                repo_key = self._infer_api_repo_key(["api", "graphql"], payload=payload)
+                if repo_key:
+                    state.record_telemetry_counter(repo_key, rate_limit_errors=1)
             if _is_missing_project_scope_error(messages):
                 raise GitHubError(
                     "GitHub token is missing Projects v2 permissions (`project` / `read:project`). "
@@ -499,6 +583,7 @@ class GitHubClient:
                     priority_options_by_name=prio_options,
                     text_fields_by_name=text_fields,
                 )
+                self._project_owner_by_id[schema.project_id] = project_owner
 
             items_conn = proj.get("items") or {}
             for node in items_conn.get("nodes") or []:
@@ -1040,7 +1125,10 @@ class GitHubClient:
         )
 
     def delete_comment(self, owner: str, repo: str, comment_id: int) -> None:
-        proc = self._run(["api", "-X", "DELETE", f"repos/{owner}/{repo}/issues/comments/{comment_id}"], None)
+        proc, _ = self._run_api(
+            ["api", "-X", "DELETE", f"repos/{owner}/{repo}/issues/comments/{comment_id}"],
+            None,
+        )
         if proc.returncode != 0 and "404" not in (proc.stderr or ""):
             raise GitHubError(f"failed to delete comment {comment_id}: {proc.stderr.strip()}")
 
@@ -1147,7 +1235,10 @@ class GitHubClient:
                     trusted.add(self.current_user().lower())
                 except GitHubError:
                     pass
-                proc = self._run(["api", f"repos/{owner}/{repo}/collaborators?per_page=100"], None)
+                proc, _ = self._run_api(
+                    ["api", f"repos/{owner}/{repo}/collaborators?per_page=100"],
+                    None,
+                )
                 if proc.returncode == 0 and proc.stdout.strip():
                     try:
                         rows = json.loads(proc.stdout)
