@@ -6,6 +6,7 @@ import contextlib
 import fcntl
 import json
 import os
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
@@ -13,6 +14,19 @@ from pathlib import Path
 from typing import Any
 
 from .model import InboxItem
+
+_THREAD_LOCKS_GUARD = threading.Lock()
+_THREAD_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _thread_lock_for(lock_file: Path) -> threading.Lock:
+    key = str(lock_file.resolve())
+    with _THREAD_LOCKS_GUARD:
+        tlock = _THREAD_LOCKS.get(key)
+        if tlock is None:
+            tlock = threading.Lock()
+            _THREAD_LOCKS[key] = tlock
+        return tlock
 
 
 def state_dir() -> Path:
@@ -45,7 +59,8 @@ def herdr_session_key() -> str:
 @contextlib.contextmanager
 def _locked(lock_file: Path) -> Iterator[None]:
     lock_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_file, "a+", encoding="utf-8") as handle:
+    tlock = _thread_lock_for(lock_file)
+    with tlock, open(lock_file, "a+", encoding="utf-8") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         try:
             yield
@@ -55,7 +70,7 @@ def _locked(lock_file: Path) -> Iterator[None]:
 
 def _atomic_write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
 
@@ -382,6 +397,40 @@ def invalidate_board_cache(slug: str, project_number: int, *, project_owner: str
                 path.unlink()
         except OSError:
             pass
+
+
+@contextlib.contextmanager
+def board_fetch_lock(slug: str, project_number: int, *, project_owner: str = "") -> Iterator[None]:
+    """Singleflight file+thread lock so concurrent cache misses coalesce into 1 GraphQL fetch."""
+    cache_file = _cache_path(slug, project_number, project_owner=project_owner)
+    lock_file = cache_file.with_name(f".{cache_file.name}.fetch.lock")
+    with _locked(lock_file):
+        yield
+
+
+# --- Persisted Daemon Sync & Heartbeat Cooldown State ---
+
+
+def load_daemon_sync_state() -> tuple[float, dict[str, float]]:
+    raw = _read_json(state_dir() / "daemon-sync.json", {})
+    if not isinstance(raw, dict):
+        return 0.0, {}
+    last_sync_at = float(raw.get("last_sync_at") or 0.0)
+    hb_raw = raw.get("heartbeats")
+    heartbeats: dict[str, float] = {}
+    if isinstance(hb_raw, dict):
+        for k, v in hb_raw.items():
+            with contextlib.suppress(TypeError, ValueError):
+                heartbeats[str(k)] = float(v)
+    return last_sync_at, heartbeats
+
+
+def save_daemon_sync_state(last_sync_at: float, heartbeats: dict[str, float]) -> None:
+    with _locked(state_dir() / ".daemon-sync.lock"):
+        _atomic_write_json(
+            state_dir() / "daemon-sync.json",
+            {"last_sync_at": last_sync_at, "heartbeats": heartbeats},
+        )
 
 
 # --- What's New Digest State ---
