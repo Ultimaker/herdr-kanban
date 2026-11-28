@@ -591,7 +591,7 @@ class HerdrClient:
         pane_id: str,
         prompt_text: str,
     ) -> None:
-        """Wait for `agy` TUI readiness in legacy `herdr` 0.9.x and fall back to `pane send-text` if dropped."""
+        """Wait for `agy` TUI readiness in legacy `herdr` 0.9.x; fall back to `pane send-text`."""
         if not prompt_text:
             return
         if agent_kind == "agy":
